@@ -723,5 +723,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe, dg_fp8_fp4_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mega_moe, dg_fp8_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mega_moe_pre_dispatch, dg_mega_moe_pre_dispatch);
 
+#include "bindings/mega_m2n.hpp"
+
 
 #endif  // DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE

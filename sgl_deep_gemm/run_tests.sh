@@ -74,8 +74,13 @@ run_test() {
   local name="$1"; shift
   echo ""
   echo "----- RUN ${name} $* -----"
+  local launch=("${PYTHON}")
+  if [ "${1:-}" = "--distributed" ]; then
+    shift
+    launch+=(-m torch.distributed.run --standalone --nproc_per_node=4)
+  fi
   local log; log=$(mktemp)
-  (cd "${TESTS_DIR}" && "${PYTHON}" "${name}" "$@") 2>&1 | tee "${log}"
+  (cd "${TESTS_DIR}" && "${launch[@]}" "${name}" "$@") 2>&1 | tee "${log}"
   local rc=${PIPESTATUS[0]}
   # Fork-based multiprocessing tests can crash in child processes while the
   # launcher still exits 0; treat an unhandled traceback as a failure too.
@@ -129,6 +134,7 @@ fi
 # pre_dispatch tests use deep_gemm's own symmetric buffer.
 MEGA_MOE_BLACKWELL=(
   test_mega_moe.py
+  test_mega_moe_m2n.py
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
   test_mega_moe_pre_dispatch.py
@@ -149,6 +155,12 @@ if [ "${SKIP_MEGA_MOE}" -eq 1 ]; then
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "--skip-mega-moe"
   done
 elif [ "${ARCH_MAJOR}" -ge 10 ]; then
+  run_test test_mega_moe_m2n.py
+  if [ "${NPROC}" -ge 4 ]; then
+    run_test test_mega_moe_m2n.py --distributed
+  else
+    skip_test "test_mega_moe_m2n.py AG2/EG2" "requires four GPUs"
+  fi
   if [ -f "${TESTS_DIR}/test_mega_moe.py" ]; then
     if (cd "${TESTS_DIR}" && "${PYTHON}" -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer')") >/dev/null 2>&1; then
       run_test test_mega_moe.py --num-processes "${NPROC}"

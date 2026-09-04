@@ -36,6 +36,7 @@ struct MegaMoEConfig {
 
     // Thread layout
     int num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads;
+    int num_dispatch_pull_stages;
 
     friend std::ostream& operator << (std::ostream& os, const MegaMoEConfig& config) {
         os << "MegaMoEConfig("
@@ -50,7 +51,8 @@ struct MegaMoEConfig {
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
-           << ", num_epilogue_threads=" << config.num_epilogue_threads << ")";
+           << ", num_epilogue_threads=" << config.num_epilogue_threads
+           << ", num_dispatch_pull_stages=" << config.num_dispatch_pull_stages << ")";
         return os;
     }
 };
@@ -137,10 +139,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Stream A0.5: under `use_mxf4_kind`, A and B smem use the dense FP4
     // layout (`_ALIGN8B`, 2 nibbles/byte). Per-stage byte footprint halves
     // for both A and B → num_stages doubles for the same smem budget.
-    const bool& use_mxf4_kind = false) {
+    const bool& use_mxf4_kind = false,
+    const int& num_dispatch_pull_stages = 1) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
+    DG_HOST_ASSERT(num_dispatch_pull_stages >= 1);
 
     // Always multicast on A
     const int load_block_m = block_m / 2;
@@ -149,7 +153,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     const int smem_send_buffers_size = align(
-        static_cast<int>(layout::Buffer(layout::Data(hidden), num_dispatch_warps, 1).get_num_bytes()),
+        static_cast<int>(layout::Buffer(
+            layout::Data(hidden), num_dispatch_warps,
+            num_dispatch_pull_stages).get_num_bytes()),
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
@@ -160,7 +166,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_cd = std::max(smem_cd_l1, smem_cd_l2);
 
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
-    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2) * 8;
+    const int smem_barriers = (
+        num_dispatch_warps * num_dispatch_pull_stages +
+        kNumEpilogueStages * 2 + num_epilogue_warps * 2) * 8;
 
     // Amax reduction
     const int smem_amax_reduction = store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float));
@@ -195,7 +203,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
-    const bool& use_mxf4_kind = false) {
+    const bool& use_mxf4_kind = false,
+    const int& num_dispatch_pull_stages = 1) {
     // Block config
     const auto [cluster_size, block_m, store_block_m, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, use_mxf4_kind);
@@ -227,7 +236,7 @@ static MegaMoEConfig get_mega_moe_config(
         block_m, block_n, block_k, store_block_m,
         sf_block_m, sf_block_n,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        use_mxf4_kind);
+        use_mxf4_kind, num_dispatch_pull_stages);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
@@ -237,7 +246,8 @@ static MegaMoEConfig get_mega_moe_config(
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
         num_stages, smem_size,
-        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
+        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
+        num_dispatch_pull_stages
     };
 
     // Print configs for the first time

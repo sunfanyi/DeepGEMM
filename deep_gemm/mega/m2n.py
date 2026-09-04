@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+from typing import Optional, Sequence, Tuple
+
+import torch
+import torch.distributed as dist
+
+from .. import _C
+from ..utils.math import align
+
+
+class MegaMoEM2NSymmBuffer:
+    """Symmetric storage shared by AG ranks followed by EG ranks."""
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        *,
+        ag_size: int,
+        eg_size: int,
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+        num_topk: int,
+        hidden: int,
+        intermediate_hidden: int,
+    ) -> None:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        self.group = group
+        self.ag_size = int(ag_size)
+        self.eg_size = int(eg_size)
+        if group.size() != self.ag_size + self.eg_size:
+            raise RuntimeError(
+                f"group size {group.size()} does not match "
+                f"ag_size + eg_size ({self.ag_size + self.eg_size})"
+            )
+
+        self.num_experts = int(num_experts)
+        self.num_topk = int(num_topk)
+        self.hidden = int(hidden)
+        self.intermediate_hidden = int(intermediate_hidden)
+        self.num_max_tokens_per_rank = align(
+            int(num_max_tokens_per_rank),
+            int(_C.get_token_alignment_for_mega_moe()),
+        )
+
+        num_bytes, num_max_pool_tokens, slice_input_buffers = (
+            _C.get_symm_buffer_size_for_mega_moe_m2n(
+                self.ag_size,
+                self.eg_size,
+                self.num_experts,
+                self.num_max_tokens_per_rank,
+                self.num_topk,
+                self.hidden,
+                self.intermediate_hidden,
+            )
+        )
+        self.num_max_pool_tokens = int(num_max_pool_tokens)
+        self.buffer = symm_mem.empty(int(num_bytes), dtype=torch.int8, device="cuda")
+        self.handle = symm_mem.rendezvous(self.buffer, group=group)
+        self.buffer.zero_()
+        _C.initialize_symm_buffer_for_mega_moe_m2n(self.buffer, self.group.size())
+        self.group.barrier().wait()
+        torch.cuda.synchronize()
+
+        (
+            self.x,
+            self.x_sf,
+            self.topk_idx,
+            self.topk_weights,
+            self.l1_acts,
+            self.l1_acts_sf,
+            self.l2_acts,
+            self.l2_acts_sf,
+        ) = map(torch.from_dlpack, slice_input_buffers(self.buffer))
+
+    @property
+    def buffer_ptrs(self) -> list[int]:
+        return list(self.handle.buffer_ptrs)
+
+    @property
+    def rank(self) -> int:
+        return int(self.group.rank())
+
+    def destroy(self) -> None:
+        self.handle = None
+        self.buffer = None
+        self.group = None
+        self.x = None
+        self.x_sf = None
+        self.topk_idx = None
+        self.topk_weights = None
+        self.l1_acts = None
+        self.l1_acts_sf = None
+        self.l2_acts = None
+        self.l2_acts_sf = None
+
+
+def get_symm_buffer_for_mega_moe_m2n(
+    group: dist.ProcessGroup,
+    *,
+    ag_size: int,
+    eg_size: int,
+    num_experts: int,
+    num_max_tokens_per_rank: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> MegaMoEM2NSymmBuffer:
+    return MegaMoEM2NSymmBuffer(
+        group,
+        ag_size=ag_size,
+        eg_size=eg_size,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+    )
+
+
+def mega_moe_m2n_ag(
+    y: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sym_buffer: MegaMoEM2NSymmBuffer,
+    *,
+    output_scale: float = 1.0,
+    num_sms: int = 0,
+) -> None:
+    """Run fused AG quantize, dispatch, combine, and output reduction."""
+    _C.mega_moe_m2n_ag(
+        y,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        sym_buffer.buffer,
+        sym_buffer.buffer_ptrs,
+        sym_buffer.rank,
+        sym_buffer.ag_size,
+        sym_buffer.eg_size,
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts,
+        sym_buffer.num_topk,
+        sym_buffer.intermediate_hidden,
+        float(output_scale),
+        int(num_sms),
+    )
+
+
+def make_m2n_weight_descs(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    num_experts_per_rank: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> torch.Tensor:
+    """Build one layer's config-independent ``[4, 128]`` descriptor blob."""
+    return torch.from_dlpack(
+        _C.make_m2n_weight_descs(
+            l1_weights[0],
+            l1_weights[1],
+            l2_weights[0],
+            l2_weights[1],
+            int(num_experts_per_rank),
+            int(hidden),
+            int(intermediate_hidden),
+        )
+    )
+
+
+def mega_moe_m2n_eg(
+    weight_descs: torch.Tensor,
+    sym_buffers: Sequence[MegaMoEM2NSymmBuffer],
+    *,
+    expected_num_tokens_per_rank: int,
+    num_experts_per_rank: int,
+    use_fp8_weights: bool = True,
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    num_sms: int = 0,
+) -> None:
+    """Run persistent EG receive, expert MLP, and response for one to four lanes."""
+    if not 1 <= len(sym_buffers) <= 4:
+        raise ValueError("sym_buffers must contain between one and four lanes")
+
+    first = sym_buffers[0]
+    for sym_buffer in sym_buffers[1:]:
+        if (
+            sym_buffer.group is not first.group
+            or sym_buffer.ag_size != first.ag_size
+            or sym_buffer.eg_size != first.eg_size
+            or sym_buffer.num_experts != first.num_experts
+            or sym_buffer.num_topk != first.num_topk
+            or sym_buffer.hidden != first.hidden
+            or sym_buffer.intermediate_hidden != first.intermediate_hidden
+            or sym_buffer.num_max_tokens_per_rank != first.num_max_tokens_per_rank
+        ):
+            raise ValueError("all M2N lanes must use the same layout and group")
+
+    ffi_buffers = list(sym_buffers) + [first] * (4 - len(sym_buffers))
+    _C.mega_moe_m2n_eg(
+        weight_descs,
+        *(sym_buffer.buffer for sym_buffer in ffi_buffers),
+        *(sym_buffer.buffer_ptrs for sym_buffer in ffi_buffers),
+        len(sym_buffers),
+        first.rank,
+        first.ag_size,
+        first.eg_size,
+        first.num_max_tokens_per_rank,
+        first.num_experts,
+        first.num_topk,
+        first.hidden,
+        first.intermediate_hidden,
+        int(expected_num_tokens_per_rank),
+        int(num_experts_per_rank),
+        bool(use_fp8_weights),
+        activation_clamp,
+        bool(fast_math),
+        int(num_sms),
+    )
