@@ -27,14 +27,14 @@ from deep_gemm.utils import (
     per_token_cast_to_fp8,
 )
 
-HIDDEN, INTERMEDIATE, EXPERTS, TOPK, CAPACITY = 512, 512, 8, 2, 128
+HIDDEN, INTERMEDIATE, EXPERTS, TOPK, CAPACITY = 512, 512, 8, 2, 129
 CLAMP = 1.25
 OUTPUT_SCALES = (1.0, 2.5)
 
 
-def test_layout() -> None:
+def test_layout(capacity: int = 132) -> None:
     ag_size, eg_size = 2, 2
-    num_experts, capacity, num_topk = 8, 128, 2
+    num_experts, num_topk = 8, 2
     hidden, intermediate_hidden = 512, 512
     num_bytes, pool_tokens, slice_buffers = _C.get_symm_buffer_size_for_mega_moe_m2n(
         ag_size,
@@ -65,6 +65,7 @@ def test_layout() -> None:
     base = buffer.data_ptr()
     end = base + buffer.numel()
     assert all(base <= view.data_ptr() < end for view in views)
+    assert all(view.data_ptr() % 16 == 0 for view in views)
     seeded_words = buffer.view(torch.int32)
     assert torch.count_nonzero(seeded_words).item() == 1
     assert seeded_words.max().item() == ag_size + eg_size
@@ -130,6 +131,9 @@ def _make_input(rank, layer, lane, count, phase):
     )
     rows = torch.arange(x.shape[0], device="cuda")
     first = (rows + 3 * rank + layer + lane) % EXPERTS
+    if phase == 0:
+        # Fill the per-source expert slots, including the final input row.
+        first.fill_(layer)
     ids = torch.stack((first, (first + EXPERTS // 2) % EXPERTS), dim=1).int()
     weights = (
         torch.rand((x.shape[0], TOPK), generator=generator, device="cuda") * 0.75
@@ -179,6 +183,7 @@ def run_distributed() -> None:
         )
         for _ in range(3)
     ]
+    assert all(buffer.num_max_tokens_per_rank == 132 for buffer in buffers)
     layers = [_make_weights(layer) for layer in range(2)]
     weight_storage, descriptors = [], []
     if rank >= 2:
@@ -213,7 +218,7 @@ def run_distributed() -> None:
     # Same allocations cross N1/N3 phases, including partial/all-empty lanes
     # and unequal counts. Each phase is one persistent EG for two layers.
     phases = (
-        ((32,), (17,)),
+        ((CAPACITY,), (CAPACITY,)),
         ((17, 7, 3), (0, 11, 1)),
         ((0,), (0,)),
         ((1, 0, 33), (9, 0, 17)),
@@ -235,29 +240,44 @@ def run_distributed() -> None:
             ]
         torch.cuda.synchronize()
         dist.barrier()
-        if rank < 2:
-            for stream in streams[:num_lanes]:
-                stream.wait_stream(torch.cuda.current_stream())
-            for layer in range(2):
-                for lane in range(num_lanes):
-                    with torch.cuda.stream(streams[lane]):
-                        mega_moe_m2n_ag(
-                            outputs[layer][lane],
-                            *inputs[layer][lane],
-                            buffers[lane],
-                            output_scale=OUTPUT_SCALES[layer],
-                            num_sms=24,
-                        )
-        else:
-            mega_moe_m2n_eg(
-                descriptors,
-                buffers[:num_lanes],
-                expected_num_tokens_per_rank=max(1, max(map(max, counts))),
-                num_experts_per_rank=EXPERTS // 2,
-                use_fp8_weights=False,
-                activation_clamp=CLAMP,
-                fast_math=True,
-            )
+
+        def run():
+            if rank < 2:
+                for stream in streams[:num_lanes]:
+                    stream.wait_stream(torch.cuda.current_stream())
+                for layer in range(2):
+                    for lane in range(num_lanes):
+                        with torch.cuda.stream(streams[lane]):
+                            mega_moe_m2n_ag(
+                                outputs[layer][lane],
+                                *inputs[layer][lane],
+                                buffers[lane],
+                                output_scale=OUTPUT_SCALES[layer],
+                                num_sms=24,
+                            )
+                for stream in streams[:num_lanes]:
+                    torch.cuda.current_stream().wait_stream(stream)
+            else:
+                mega_moe_m2n_eg(
+                    descriptors,
+                    buffers[:num_lanes],
+                    expected_num_tokens_per_rank=max(1, max(map(max, counts))),
+                    num_experts_per_rank=EXPERTS // 2,
+                    use_fp8_weights=False,
+                    activation_clamp=CLAMP,
+                    fast_math=True,
+                )
+
+        run()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for layer_outputs in outputs:
+            for output in layer_outputs:
+                output.fill_(float("nan"))
+        graph.replay()
         torch.cuda.synchronize()
         dist.barrier()
         if rank < 2:
@@ -281,7 +301,8 @@ def run_distributed() -> None:
 
 if __name__ == "__main__":
     if int(os.environ.get("WORLD_SIZE", "1")) == 1:
-        test_layout()
+        for capacity in (4, 128, 132):
+            test_layout(capacity)
     else:
         run_distributed()
     print("OK")

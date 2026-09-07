@@ -18,7 +18,6 @@ struct WorkspaceM2N {
     uint32_t num_ag_ranks, num_eg_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
-    uint32_t num_max_recv_tokens_per_expert;
 
     // Pool capacity: all local experts of an EG rank share a contiguous pool
     uint32_t num_max_pool_tokens;
@@ -46,7 +45,6 @@ struct WorkspaceM2N {
         num_experts(num_experts),
         num_max_tokens_per_rank(num_max_tokens_per_rank) {
         num_experts_per_rank = num_experts / num_eg_ranks;
-        num_max_recv_tokens_per_expert = num_ag_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(
             num_ag_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
         num_max_pool_blocks = num_max_pool_tokens / kMinCandidateBlockM;
@@ -74,7 +72,7 @@ struct WorkspaceM2N {
 
         // Dispatch pulling source token-topk
         num_bytes += static_cast<uint64_t>(num_experts_per_rank) * num_ag_ranks *
-                     num_max_recv_tokens_per_expert * sizeof(int);
+                     num_max_tokens_per_rank * sizeof(int);
 
         // Combine push source indices
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
@@ -135,14 +133,14 @@ struct WorkspaceM2N {
         return reinterpret_cast<uint64_t*>(base) + pool_block_idx;
     }
 
-    // For dispatch pulling: [local expert][source AG rank][slot]
+    // Top-k selects each expert at most once per token, so each source needs
+    // only its own input capacity: [local expert][source AG rank][slot].
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
         const auto base = get_l2_arrival_mask_ptr(num_max_pool_blocks);
         return reinterpret_cast<uint32_t*>(base) +
-            expert_idx * (num_ag_ranks * num_max_recv_tokens_per_expert) +
-            rank_idx * num_max_recv_tokens_per_expert + token_idx;
+            (expert_idx * num_ag_ranks + rank_idx) * num_max_tokens_per_rank + token_idx;
     }
 
     CUTLASS_DEVICE

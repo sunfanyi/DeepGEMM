@@ -39,10 +39,9 @@ class MegaMoEM2NSymmBuffer:
         self.num_topk = int(num_topk)
         self.hidden = int(hidden)
         self.intermediate_hidden = int(intermediate_hidden)
-        self.num_max_tokens_per_rank = align(
-            int(num_max_tokens_per_rank),
-            int(_C.get_token_alignment_for_mega_moe()),
-        )
+        # Keep FP32 routing-weight regions 16-byte aligned. BLOCK_M alignment
+        # belongs to the expert pools, not the per-source input capacity.
+        self.num_max_tokens_per_rank = align(int(num_max_tokens_per_rank), 4)
 
         num_bytes, num_max_pool_tokens, slice_input_buffers = (
             _C.get_symm_buffer_size_for_mega_moe_m2n(
