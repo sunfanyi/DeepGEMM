@@ -348,27 +348,14 @@ static void sm100_mega_moe_m2n_eg(
         : device_runtime->get_num_sms();
     num_sms = std::max(num_sms / 2 * 2, 4);
 
-    constexpr int num_dispatch_pull_stages = 2;
+    constexpr int num_dispatch_pull_stages = 1;
 
-    // Heuristics: source ranks are the AG ranks
-    auto config = get_mega_moe_config(
+    // Fixed M64 and full expert waves avoid routing-sensitive small-block regressions.
+    const auto config = get_mega_moe_config(
         num_ag_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, expected_num_tokens_per_rank, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
-        false, num_dispatch_pull_stages);
-    // The symmetric MegaMoE heuristic assumes the number of token-source ranks
-    // equals the number of expert-owner ranks.  M2N breaks that assumption:
-    // each EG rank receives tokens from all AG ranks but owns only the experts
-    // for one EG shard.  Scale the per-source-rank decode bucket by AG/EG for
-    // wave budgeting, otherwise large fan-in runs underestimate rows/expert
-    // and process too many experts per wave.
-    const int64_t m2n_wave_expected_tokens =
-        std::max<int64_t>(1, (
-            static_cast<int64_t>(expected_num_tokens_per_rank) * num_ag_ranks +
-            num_eg_ranks - 1) / num_eg_ranks);
-    config.num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
-        num_experts_per_rank, static_cast<int>(m2n_wave_expected_tokens), num_topk,
-        intermediate_hidden, config.block_m, config.block_n, num_sms);
+        false, num_dispatch_pull_stages, true);
 
     // Make tensormaps (same as the symmetric kernel)
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,

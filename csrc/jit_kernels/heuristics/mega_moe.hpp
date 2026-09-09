@@ -204,10 +204,12 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
     const bool& use_mxf4_kind = false,
-    const int& num_dispatch_pull_stages = 1) {
+    const int& num_dispatch_pull_stages = 1,
+    const bool& is_m2n = false) {
     // Block config
     const auto [cluster_size, block_m, store_block_m, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, use_mxf4_kind);
+        is_m2n ? std::tuple<int, int, int, int>{2, 64, 32, 128}
+               : get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, use_mxf4_kind);
     const int block_n = 128;
     const int block_k = 128;
     const int load_block_m = block_m / 2;
@@ -221,9 +223,10 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Waves
     const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
+    const int num_experts_per_wave = is_m2n ? num_experts_per_rank
+        : get_num_experts_per_wave_for_mega_moe(
+            num_experts_per_rank, num_tokens, num_topk,
+            intermediate_hidden, block_m, block_n, num_sms);
 
     // Thread layout
     const int num_dispatch_threads = 128;
@@ -253,8 +256,8 @@ static MegaMoEConfig get_mega_moe_config(
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, m2n={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk, is_m2n);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;
