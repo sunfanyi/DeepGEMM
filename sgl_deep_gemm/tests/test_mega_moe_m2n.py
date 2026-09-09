@@ -4,6 +4,7 @@ Single GPU: python test_mega_moe_m2n.py
 AG2/EG2: torchrun --standalone --nproc_per_node=4 test_mega_moe_m2n.py
 """
 
+import argparse
 import os
 from datetime import timedelta
 
@@ -71,7 +72,7 @@ def test_layout(capacity: int = 132) -> None:
     assert seeded_words.max().item() == ag_size + eg_size
 
 
-def _make_weights(layer: int):
+def _make_weights(layer: int, use_fp8_weights: bool = False):
     generator = torch.Generator(device="cuda").manual_seed(100 + layer)
     quantized, reference = [], []
     for n, k in ((2 * INTERMEDIATE, HIDDEN), (HIDDEN, INTERMEDIATE)):
@@ -84,12 +85,25 @@ def _make_weights(layer: int):
             )
             * 0.125
         )
-        packed, scales = per_token_cast_to_fp4(raw, use_ue8m0=True, gran_k=32)
-        reference.append(
-            cast_back_from_fp4(packed, scales, gran_k=32).view(EXPERTS, n, k)
-        )
+        if use_fp8_weights:
+            blocks = raw.float().view(EXPERTS, n // 128, 128, k // 128, 128)
+            scales = blocks.abs().amax(dim=(2, 4)).clamp_min(1e-4) / 448
+            scales = torch.exp2(torch.ceil(torch.log2(scales)))
+            packed = (blocks / scales[:, :, None, :, None]).to(torch.float8_e4m3fn)
+            packed = packed.reshape(EXPERTS * n, k)
+            scales = scales.repeat_interleave(128, dim=1).repeat_interleave(4, dim=2)
+            reference.append(
+                (
+                    packed.float().view(EXPERTS, n, k // 32, 32) * scales.unsqueeze(-1)
+                ).view(EXPERTS, n, k)
+            )
+        else:
+            packed, scales = per_token_cast_to_fp4(raw, use_ue8m0=True, gran_k=32)
+            reference.append(
+                cast_back_from_fp4(packed, scales, gran_k=32).view(EXPERTS, n, k)
+            )
         quantized.append(
-            (packed.view(EXPERTS, n, k // 2), scales.view(EXPERTS, n, k // 32))
+            (packed.view(EXPERTS, n, -1), scales.view(EXPERTS, n, k // 32))
         )
     return quantized, reference
 
@@ -99,7 +113,7 @@ def _fp8_roundtrip(x: torch.Tensor) -> torch.Tensor:
     return (packed.float().view(x.shape[0], -1, 32) * scales.unsqueeze(-1)).view_as(x)
 
 
-def _reference(x, ids, weights, layer_weights, output_scale):
+def _reference(x, ids, weights, layer_weights, output_scale, clamp=CLAMP):
     # Match the actual quantized operands, not the original BF16 weights.
     x = _fp8_roundtrip(x.float())
     output = torch.zeros_like(x)
@@ -109,8 +123,9 @@ def _reference(x, ids, weights, layer_weights, output_scale):
             continue
         gate_up = (x[rows] @ layer_weights[0][expert].T).bfloat16().float()
         gate, up = gate_up.chunk(2, dim=-1)
-        gate = gate.clamp(max=CLAMP)
-        up = up.clamp(-CLAMP, CLAMP)
+        if clamp is not None:
+            gate = gate.clamp(max=clamp)
+            up = up.clamp(-clamp, clamp)
         activation = (gate / (1 + torch.exp(-gate))) * up
         activation = _fp8_roundtrip(activation * weights[rows, slots, None])
         expert_output = (activation @ layer_weights[1][expert].T).bfloat16().float()
@@ -165,7 +180,7 @@ def _check_output(actual, expected, ids, label):
     assert relative_rms <= 2**-8, label
 
 
-def run_distributed() -> None:
+def run_distributed(use_fp8_weights: bool = False) -> None:
     dist.init_process_group("nccl", timeout=timedelta(seconds=120))
     assert dist.get_world_size() == 4, "Use torchrun --nproc_per_node=4 (AG2/EG2)"
     rank, group = dist.get_rank(), dist.group.WORLD
@@ -184,7 +199,8 @@ def run_distributed() -> None:
         for _ in range(3)
     ]
     assert all(buffer.num_max_tokens_per_rank == 132 for buffer in buffers)
-    layers = [_make_weights(layer) for layer in range(2)]
+    layers = [_make_weights(layer, use_fp8_weights) for layer in range(2)]
+    clamp = None if use_fp8_weights else CLAMP
     weight_storage, descriptors = [], []
     if rank >= 2:
         local_experts = EXPERTS // 2
@@ -192,7 +208,8 @@ def run_distributed() -> None:
         for quantized, _ in layers:
             local_weights = []
             for packed, scales in quantized:
-                n, k = packed.shape[1], packed.shape[2] * 2
+                n = packed.shape[1]
+                k = packed.shape[2] * (1 if use_fp8_weights else 2)
                 packed = packed[start : start + local_experts].contiguous()
                 scales = deep_gemm.transform_sf_into_required_layout(
                     scales[start : start + local_experts].contiguous(),
@@ -215,13 +232,14 @@ def run_distributed() -> None:
         descriptors = torch.stack(descriptors).cuda()
     streams = [torch.cuda.Stream() for _ in range(3)] if rank < 2 else []
 
-    # Same allocations cross N1/N3 phases, including partial/all-empty lanes
+    # Same allocations cross N1/N2/N3 phases, including partial/all-empty lanes
     # and unequal counts. Each phase is one persistent EG for two layers.
     phases = (
         ((CAPACITY,), (CAPACITY,)),
         ((17, 7, 3), (0, 11, 1)),
         ((0,), (0,)),
         ((1, 0, 33), (9, 0, 17)),
+        ((16, 8), (13, 0)),
     )
     for phase, counts in enumerate(phases):
         num_lanes = len(counts[0])
@@ -263,8 +281,8 @@ def run_distributed() -> None:
                     buffers[:num_lanes],
                     expected_num_tokens_per_rank=max(1, max(map(max, counts))),
                     num_experts_per_rank=EXPERTS // 2,
-                    use_fp8_weights=False,
-                    activation_clamp=CLAMP,
+                    use_fp8_weights=use_fp8_weights,
+                    activation_clamp=clamp,
                     fast_math=True,
                 )
 
@@ -284,7 +302,9 @@ def run_distributed() -> None:
             for layer in range(2):
                 for lane in range(num_lanes):
                     data = inputs[layer][lane]
-                    expected = _reference(*data, layers[layer][1], OUTPUT_SCALES[layer])
+                    expected = _reference(
+                        *data, layers[layer][1], OUTPUT_SCALES[layer], clamp
+                    )
                     _check_output(
                         outputs[layer][lane],
                         expected,
@@ -300,9 +320,15 @@ def run_distributed() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fp8", action="store_true")
+    parser.add_argument("--hidden", type=int, default=HIDDEN)
+    parser.add_argument("--intermediate", type=int, default=INTERMEDIATE)
+    args = parser.parse_args()
+    HIDDEN, INTERMEDIATE = args.hidden, args.intermediate
     if int(os.environ.get("WORLD_SIZE", "1")) == 1:
         for capacity in (4, 128, 132):
             test_layout(capacity)
     else:
-        run_distributed()
+        run_distributed(use_fp8_weights=args.fp8)
     print("OK")
