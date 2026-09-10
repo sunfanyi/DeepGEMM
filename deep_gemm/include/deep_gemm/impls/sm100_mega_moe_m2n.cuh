@@ -313,9 +313,16 @@ sm100_mega_moe_m2n_ag_impl(void* y,
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    (1ull << 32) | (expert_status & 0xffffffff));
+            }
+            asm volatile("fence.release.sys;" ::: "memory");
+            #pragma unroll
+            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                const auto dst_rank_idx = kNumAGRanks + i / kNumExpertsPerEGRank;
+                const auto dst_local_expert_idx = i % kNumExpertsPerEGRank;
+                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                asm volatile("red.relaxed.sys.global.add.u64 [%0], %1;" ::
+                    "l"(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx)),
+                    "l"((1ull << 32) | (expert_status & 0xffffffff)) : "memory");
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -874,6 +881,8 @@ sm100_mega_moe_m2n_eg_impl(
         // remotely-written src indices / token data it gates.
         scheduler.fetch_expert_recv_count();
         fence_acquire_sys();
+        // Share each lane's acquired expert metadata with the whole pull warp.
+        __syncwarp();
 
         uint32_t expert_pool_block_offset = 0;
 
