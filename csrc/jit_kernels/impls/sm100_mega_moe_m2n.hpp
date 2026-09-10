@@ -91,9 +91,10 @@ static std::tuple<int, int> get_ag_combine_smem_config_m2n(
     constexpr int kSmemAlignment = 1024;
     const int num_combine_warps = num_combine_threads / 32;
     const int num_hidden_bytes = hidden * 2;
+    // Preserve the chunk size to keep combine accumulator register use unchanged.
     const int num_chunks = (3 * num_combine_warps * num_hidden_bytes <= 160 * 1024) ? 1 : 2;
     const int chunk_bytes = num_hidden_bytes / num_chunks;
-    const int smem_chunks = align(3 * num_combine_warps * chunk_bytes, kSmemAlignment);
+    const int smem_chunks = align(2 * num_combine_warps * chunk_bytes, kSmemAlignment);
     const int smem_expert_count = align(num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     const int smem_barriers = num_combine_warps * 2 * 8;
     return {num_chunks, smem_chunks + smem_expert_count + smem_barriers};

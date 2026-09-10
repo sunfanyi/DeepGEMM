@@ -137,19 +137,19 @@ sm100_mega_moe_m2n_ag_impl(void* y,
     const auto combine_token_buffer = layout::Buffer(
         bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
 
-    // Shared memory: combine chunk slots first (reused as nothing else after
-    // dispatch), expert counters next, barriers last.
+    // Shared memory: double-buffered combine loads, expert counters, barriers.
     constexpr uint32_t kSharedMemoryAlignment = 1024;
     extern __shared__ __align__(kSharedMemoryAlignment) uint8_t smem_buffer[];
 
     constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
-    constexpr uint32_t kNumChunkSlots = 3;
+    constexpr uint32_t kNumLoadSlots = 2;
     constexpr uint32_t kCombineSmemBudget = 160 * 1024;
+    // Preserve the chunk size to keep combine accumulator register use unchanged.
     constexpr uint32_t kNumChunks =
-        (kNumChunkSlots * kNumCombineWarps * kNumHiddenBytes <= kCombineSmemBudget) ? 1 : 2;
+        (3 * kNumCombineWarps * kNumHiddenBytes <= kCombineSmemBudget) ? 1 : 2;
     constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
     constexpr uint32_t SMEM_CHUNK_SIZE = math::constexpr_align(
-        kNumChunkSlots * kNumCombineWarps * kNumChunkBytes, kSharedMemoryAlignment);
+        kNumLoadSlots * kNumCombineWarps * kNumChunkBytes, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_EXPERT_COUNT_SIZE = math::constexpr_align<uint32_t>(
         kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
 
@@ -190,59 +190,55 @@ sm100_mega_moe_m2n_ag_impl(void* y,
     // ---- fused per-32 FP8 quant + route metadata staging ----------------
     // hidden [num_tokens, kHidden] bf16 -> x (e4m3) + x_sf (UE8M0 bytes,
     // ceil) in the LOCAL symmetric buffer, and the top-k weights staged next
-    // to them: the EG kernel pulls all three regions remotely, so they must
-    // live in the symmetric buffer before the tag-1 barrier (the grid sync
-    // ahead of the count push orders these writes for every SM).
+    // to them. The grid sync before count publication orders all quantization
+    // writes before EG reads these regions remotely.
     {
         constexpr uint32_t kNumGroups = kHidden / 32;
-        constexpr uint32_t kNumWarps = kNumThreads / 32;
         const auto x_base = input_token_buffer.get_base_ptr<uint8_t>();
         const auto sf_base = input_sf_buffer.get_base_ptr<uint8_t>();
         const auto w_base = input_topk_weights_buffer.get_base_ptr<float>();
-        for (uint32_t t = sm_idx * kNumWarps + warp_idx; t < num_tokens; t += kNumSMs * kNumWarps) {
-            const auto src = hidden_bf16 + t * kHidden;
-            const auto x_row = x_base + t * kHidden;
-            const auto sf_row = sf_base + t * kNumGroups;
+        // Spread independent quantization groups across the grid, including small batches.
+        for (uint32_t g = sm_idx * kNumThreads + thread_idx;
+             g < num_tokens * kNumGroups;
+             g += kNumSMs * kNumThreads) {
+            uint4 raw[4];
+            const auto src_vec = reinterpret_cast<const uint4*>(hidden_bf16 + g * 32);
             #pragma unroll
-            for (uint32_t g = lane_idx; g < kNumGroups; g += 32) {
-                uint4 raw[4];
-                const auto src_vec = reinterpret_cast<const uint4*>(src + g * 32);
+            for (uint32_t j = 0; j < 4; ++ j)
+                raw[j] = __ldg(src_vec + j);
+            float vals[32];
+            #pragma unroll
+            for (uint32_t j = 0; j < 4; ++ j) {
+                const auto h = reinterpret_cast<const nv_bfloat16*>(raw + j);
                 #pragma unroll
-                for (uint32_t j = 0; j < 4; ++ j)
-                    raw[j] = __ldg(src_vec + j);
-                float vals[32];
-                #pragma unroll
-                for (uint32_t j = 0; j < 4; ++ j) {
-                    const auto h = reinterpret_cast<const nv_bfloat16*>(raw + j);
-                    #pragma unroll
-                    for (uint32_t k = 0; k < 8; ++ k)
-                        vals[j * 8 + k] = __bfloat162float(h[k]);
-                }
-                float amax = 1e-4f;
-                #pragma unroll
-                for (uint32_t k = 0; k < 32; ++ k)
-                    amax = fmaxf(amax, fabsf(vals[k]));
-                // ceil-to-UE8M0 of (amax / 448): bump the exponent when any
-                // mantissa bit is set, then scale by the exact power of two.
-                const uint32_t bits = __float_as_uint(amax * (1.0f / 448.0f));
-                const uint32_t e = ((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) ? 1u : 0u);
-                sf_row[g] = static_cast<uint8_t>(e);
-                const float inv_scale = __uint_as_float((254u - e) << 23);
-                uint32_t packed[8];
-                #pragma unroll
-                for (uint32_t k = 0; k < 16; ++ k) {
-                    reinterpret_cast<__nv_fp8x2_storage_t*>(packed)[k] = __nv_cvt_float2_to_fp8x2(
-                        make_float2(vals[2 * k] * inv_scale, vals[2 * k + 1] * inv_scale),
-                        __NV_SATFINITE, __NV_E4M3);
-                }
-                const auto dst_vec = reinterpret_cast<uint4*>(x_row + g * 32);
-                dst_vec[0] = *reinterpret_cast<uint4*>(packed);
-                dst_vec[1] = *reinterpret_cast<uint4*>(packed + 4);
+                for (uint32_t k = 0; k < 8; ++ k)
+                    vals[j * 8 + k] = __bfloat162float(h[k]);
             }
-            if (lane_idx < kNumTopk)
-                w_base[t * kNumTopk + lane_idx] =
-                    __ldg(topk_weights_in + t * kNumTopk + lane_idx);
+            float amax = 1e-4f;
+            #pragma unroll
+            for (uint32_t k = 0; k < 32; ++ k)
+                amax = fmaxf(amax, fabsf(vals[k]));
+            // ceil-to-UE8M0 of (amax / 448): bump the exponent when any
+            // mantissa bit is set, then scale by the exact power of two.
+            const uint32_t bits = __float_as_uint(amax * (1.0f / 448.0f));
+            const uint32_t e = ((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) ? 1u : 0u);
+            sf_base[g] = static_cast<uint8_t>(e);
+            const float inv_scale = __uint_as_float((254u - e) << 23);
+            uint32_t packed[8];
+            #pragma unroll
+            for (uint32_t k = 0; k < 16; ++ k) {
+                reinterpret_cast<__nv_fp8x2_storage_t*>(packed)[k] = __nv_cvt_float2_to_fp8x2(
+                    make_float2(vals[2 * k] * inv_scale, vals[2 * k + 1] * inv_scale),
+                    __NV_SATFINITE, __NV_E4M3);
+            }
+            const auto dst_vec = reinterpret_cast<uint4*>(x_base + g * 32);
+            dst_vec[0] = *reinterpret_cast<uint4*>(packed);
+            dst_vec[1] = *reinterpret_cast<uint4*>(packed + 4);
         }
+        for (uint32_t i = sm_idx * kNumThreads + thread_idx;
+             i < num_tokens * kNumTopk;
+             i += kNumSMs * kNumThreads)
+            w_base[i] = __ldg(topk_weights_in + i);
         __syncthreads();
     }
 
@@ -282,6 +278,9 @@ sm100_mega_moe_m2n_ag_impl(void* y,
         // Get SM offsets in the global send counters
         #pragma unroll
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+            // A zero count needs no slot offset; grid sync orders all active SMs.
+            if (smem_expert_count[i] == 0)
+                continue;
             const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
             smem_expert_count[i] = static_cast<uint32_t>(
                 ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
@@ -378,8 +377,6 @@ sm100_mega_moe_m2n_ag_impl(void* y,
         const auto combine_load_buffer = utils::PatternVisitor([&](const uint32_t& i) {
             return math::advance_ptr<uint4>(smem_buffer, (combine_warp_idx + i * kNumCombineWarps) * kNumChunkBytes);
         });
-        const auto combine_store_buffer = math::advance_ptr<uint4>(
-            smem_buffer, (combine_warp_idx + kNumCombineWarps * 2) * kNumChunkBytes);
         auto combine_load_barriers = utils::PatternVisitor([&](const uint32_t& i) {
             return combine_barriers[i + combine_warp_idx * 2];
         });
@@ -435,6 +432,8 @@ sm100_mega_moe_m2n_ag_impl(void* y,
                     load_stage_idx ^= 1;
                 }
 
+                auto output_ptr = math::advance_ptr<uint4>(
+                    y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset);
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                     uint4 casted;
@@ -445,23 +444,8 @@ sm100_mega_moe_m2n_ag_impl(void* y,
                             reduced[j * kNumElemsPerUint4 + l],
                             {output_scale, output_scale}));
 
-                    if (j == 0) {
-                        ptx::tma_store_wait<0>();
-                        __syncwarp();
-                    }
-                    ptx::st_shared(combine_store_buffer + j * 32 + lane_idx,
-                                   casted.x, casted.y, casted.z, casted.w);
+                    output_ptr[j * 32 + lane_idx] = casted;
                 }
-                __syncwarp();
-
-                if (cute::elect_one_sync()) {
-                    cute::tma_store_fence();
-                    ptx::tma_store_1d(
-                        math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset),
-                        combine_store_buffer, kNumChunkBytes);
-                    cute::tma_store_arrive();
-                }
-                __syncwarp();
             }
         }
     }
