@@ -811,7 +811,7 @@ sm100_mega_moe_m2n_eg_impl(
         bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
 
     // Task scheduler: experts of this EG rank; sources are the AG ranks
-    auto scheduler = sched::MegaMoEScheduler<
+    auto scheduler = sched::LegacyMegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
@@ -823,8 +823,8 @@ sm100_mega_moe_m2n_eg_impl(
         L2_SHAPE_N / BLOCK_N,
         L1_SHAPE_K / BLOCK_K,
         L2_SHAPE_K / BLOCK_K,
-        /* kRecvCountHighTarget = */ kNumAGRanks,
-        layout::WorkspaceM2N>(workspace);
+        layout::WorkspaceM2N,
+        /* kRecvCountHighTarget = */ kNumAGRanks>(workspace);
 
     // Intra-SM Barrier indices
     constexpr uint32_t kDispatchBarrierIdx = 0;

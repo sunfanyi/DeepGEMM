@@ -22,6 +22,16 @@ struct GemmDesc {
     int num_sms, tc_util;
     std::string compiled_dims;
 
+    // SM100 m-grouped psum layout padding contract
+    bool ensure_zero_padding = true;
+
+    // SF granularity for split-K alignment: max(gran_k_a, gran_k_b).
+    int max_gran_k = 128;
+
+    // False for AB-swap (transposed, stride_cd_n != 1) output: the TMA-store epilogue
+    // cannot express it, so the kernel falls back to the strided-store epilogue.
+    bool cd_n_contiguous = true;
+
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
@@ -60,6 +70,7 @@ struct GemmDesc {
            << ", num_sms=" << desc.num_sms
            << ", tc_util=" << desc.tc_util
            << ", compiled_dims=" << desc.compiled_dims
+           << ", ensure_zero_padding=" << static_cast<int>(desc.ensure_zero_padding)
            << ", expected_m=" << desc.expected_m
            << ", expected_n=" << desc.expected_n
            << ", expected_k=" << desc.expected_k
@@ -141,13 +152,15 @@ struct GemmConfig {
     StorageConfig storage_config;
     PipelineConfig pipeline_config;
     LaunchConfig launch_config;
+    int split_k_factor = 1;
 
     friend std::ostream& operator << (std::ostream& os, const GemmConfig& config) {
         os << "GemmConfig("
            << "layout=" << config.layout
            << ", storage_config=" << config.storage_config
            << ", pipeline_config=" << config.pipeline_config
-           << ", launch_config=" << config.launch_config << ")";
+           << ", launch_config=" << config.launch_config
+           << ", split_k=" << config.split_k_factor << ")";
         return os;
     }
 };

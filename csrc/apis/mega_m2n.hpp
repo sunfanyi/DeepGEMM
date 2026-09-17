@@ -79,7 +79,7 @@ get_symm_buffer_size_for_mega_moe_m2n(
     for (const int block_m : layout::kCandidateBlockM) {
         num_max_padded_sf_pool_tokens = std::max(
             num_max_padded_sf_pool_tokens,
-            layout::get_num_padded_sf_pool_tokens(
+            layout::get_num_sf_ring_tokens(
                 num_max_pool_tokens, block_m));
     }
 

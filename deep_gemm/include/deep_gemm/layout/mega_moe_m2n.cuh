@@ -23,8 +23,9 @@ struct WorkspaceM2N {
     uint32_t num_max_pool_tokens;
     uint32_t num_max_pool_blocks;
 
-    static constexpr uint64_t kNumBarrierSignalBytes = Workspace::kNumBarrierSignalBytes;
-    static constexpr uint32_t kNumMaxGridSyncCounters = Workspace::kNumMaxGridSyncCounters;
+    // M2N has no in-kernel task counters and keeps its compact barrier layout.
+    static constexpr uint64_t kNumBarrierSignalBytes = 32;
+    static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     CUTLASS_HOST_DEVICE
     static constexpr uint64_t get_nvl_barrier_signal_offset(

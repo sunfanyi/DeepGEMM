@@ -12,7 +12,7 @@
 #include <deep_gemm/layout/mega_moe_m2n.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
-#include "../heuristics/mega_moe.hpp"
+#include "../heuristics/mega_moe_m2n.hpp"
 
 namespace deep_gemm {
 
@@ -163,7 +163,7 @@ public:
         float activation_clamp;
         bool fast_math;
         bool use_fp8_weights;
-        MegaMoEConfig config;
+        MegaMoEM2NConfig config;
 
         int num_lanes;
         layout::SymBuffer<> sym_buffer_ptrs;
@@ -349,14 +349,11 @@ static void sm100_mega_moe_m2n_eg(
         : device_runtime->get_num_sms();
     num_sms = std::max(num_sms / 2 * 2, 4);
 
-    constexpr int num_dispatch_pull_stages = 1;
-
     // Fixed M64 and full expert waves avoid routing-sensitive small-block regressions.
-    const auto config = get_mega_moe_config(
+    const auto config = get_mega_moe_m2n_config(
         num_ag_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, expected_num_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden, num_padded_sf_pool_tokens,
-        false, num_dispatch_pull_stages, true);
+        hidden, intermediate_hidden, num_padded_sf_pool_tokens);
 
     // Make tensormaps (same as the symmetric kernel)
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,

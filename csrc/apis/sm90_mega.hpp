@@ -4,11 +4,30 @@
 
 #include "mega.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
+#include "../jit_kernels/impls/sm90_mega_moe_pre_dispatch.hpp"
 
 namespace deep_gemm::mega {
 
 static int get_token_alignment_for_sm90_mega_moe() {
     return layout::kLCMCandidateBlockM;
+}
+
+static void mega_moe_pre_dispatch_sm90(
+    const torch::Tensor& x,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& buf_x,
+    const torch::Tensor& buf_x_sf,
+    const torch::Tensor& buf_topk_idx,
+    const torch::Tensor& buf_topk_weights,
+    const int& num_tokens,
+    const int& group_size,
+    const float& routed_scaling_factor) {
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    sm90_mega_moe_pre_dispatch(
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, routed_scaling_factor);
 }
 
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
@@ -21,7 +40,8 @@ get_symm_buffer_size_for_sm90_mega_moe(
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
 
-    const auto workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
+    const auto workspace = layout::SM90Workspace(
+        nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
 
     const auto fp8_token_layout = layout::Data(hidden);
     const auto bf16_token_layout = layout::Data(hidden * 2);
@@ -50,7 +70,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
     for (int block_m: layout::kCandidateBlockM) {
         num_max_padded_sf_pool_tokens = std::max(
             num_max_padded_sf_pool_tokens,
-            layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m)
+            layout::get_num_sf_ring_tokens(num_max_pool_tokens, block_m)
         );
     }
 

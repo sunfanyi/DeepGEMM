@@ -18,13 +18,15 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 def pack_ue8m0_to_int(x: torch.Tensor):
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
-    assert (x.view(torch.int) & ((1 << 23) - 1) == 0).all()
-    return (x.view(torch.int) >> 23).to(torch.uint8).view(torch.int)
+    x_int = x.view(torch.int)
+    assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
+    return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
 def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
                           use_packed_ue8m0: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
+    assert not use_packed_ue8m0 or use_ue8m0
     m, n = x.shape
     padded_n = align(n, gran_k)
     x_padded = torch.empty((m, padded_n), dtype=x.dtype, device=x.device).fill_(0)
@@ -34,7 +36,17 @@ def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     sf = x_amax / 448.0
     sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_fp8 = (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, padded_n)[:, :n].contiguous()
-    return x_fp8, pack_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
+    if use_packed_ue8m0:
+        # `pack_ue8m0_to_int` packs 4 ue8m0 bytes into one int32, so the scale count
+        # must be a multiple of 4. Small head dims (e.g. 32 with gran_k=32 -> 1 scale)
+        # pad with 1.0 (= 2^0, mantissa-zero so it satisfies the pack assert); the
+        # padding scales cover no real elements and are never read by the kernel.
+        num_sf = sf.size(-1)
+        if num_sf % 4 != 0:
+            pad = align(num_sf, 4) - num_sf
+            sf = torch.nn.functional.pad(sf, (0, pad), value=1.0)
+        return x_fp8, pack_ue8m0_to_int(sf)
+    return x_fp8, sf
 
 
 def per_channel_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -70,14 +82,13 @@ def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple, use_ue8m0: bool) -
 
 
 def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
-    ax = x.abs().clamp_max(6.0)
+    ax = x.abs()
     # {0, 0.5, 1, 1.5, 2, 3, 4, 6}
     # midpoints: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
-    boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-                              device=x.device, dtype=ax.dtype)
-    idx = torch.bucketize(ax, boundaries) 
-    code = idx.to(torch.uint8)
-    sign = (x < 0) & (idx != 0)
+    code = torch.zeros_like(x, dtype=torch.uint8)
+    for boundary in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        code += (ax > boundary).to(torch.uint8)
+    sign = (x < 0) & (code != 0)
     code = code | (sign.to(torch.uint8) << 3)
     return code.view(torch.int8)
 
@@ -98,7 +109,56 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)  # int8, (m, padded_n)
     codes2 = codes.view(m, padded_n // 2, 2)
     packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)  # int8
-    return packed[:, :n // 2].contiguous(), pack_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
+    if use_packed_ue8m0:
+        # `pack_ue8m0_to_int` packs 4 ue8m0 bytes into one int32, so the scale count
+        # must be a multiple of 4. Small head dims (e.g. 64 with gran_k=32 -> 2 scales)
+        # pad with 1.0 (= 2^0, mantissa-zero so it satisfies the pack assert); the
+        # padding scales cover no real elements and are never read by the kernel.
+        num_sf = sf.size(-1)
+        if num_sf % 4 != 0:
+            pad = align(num_sf, 4) - num_sf
+            sf = torch.nn.functional.pad(sf, (0, pad), value=1.0)
+        return packed[:, :n // 2].contiguous(), pack_ue8m0_to_int(sf)
+    return packed[:, :n // 2].contiguous(), sf
+
+
+def cast_to_ue4m3(x: torch.Tensor) -> torch.Tensor:
+    return x.to(torch.float8_e4m3fn).float()
+
+
+def pack_ue4m3_to_int(x: torch.Tensor) -> torch.Tensor:
+    """Pack 4 UE4M3 scaling factor bytes into one int32, matching the kernel's SF word."""
+    assert x.size(-1) % 4 == 0
+    return x.to(torch.float8_e4m3fn).contiguous().view(torch.uint8).view(torch.int)
+
+
+def unpack_ue4m3_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
+    return packed_sf.view(torch.uint8).view(torch.float8_e4m3fn).float()
+
+
+def per_token_cast_to_nvfp4(x: torch.Tensor, gran_k: int = 16,
+                            use_packed_ue4m3: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """NVFP4: E2M1 values with one UE4M3 (not pow2 UE8M0) scaling factor per `gran_k` elements."""
+    m, n = x.shape
+    assert n % gran_k == 0
+    x_view = x.view(m, -1, gran_k)
+    sf = cast_to_ue4m3(x_view.abs().float().amax(dim=2) / 6.0)
+    sf_inv = torch.where(sf > 0, 1.0 / sf, torch.zeros_like(sf))
+    codes = _quantize_to_fp4_e2m1(x_view.float() * sf_inv.unsqueeze(2)).view(m, n)
+    codes2 = codes.view(m, n // 2, 2)
+    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
+    return packed.contiguous(), pack_ue4m3_to_int(sf) if use_packed_ue4m3 else sf
+
+
+def transform_ue4m3_sf_into_required_layout(sf: torch.Tensor, mn: int) -> torch.Tensor:
+    """MN-major, TMA-aligned, int32-packed UE4M3 SFs — the weight-side layout the kernel reads.
+
+    `transform_sf_into_required_layout` only knows how to pack UE8M0, so NVFP4 weight SFs are
+    packed here and handed to its already-packed `(INT, 1, gran_k)` branch.
+    """
+    assert sf.dim() in (2, 3) and sf.size(-2) == mn
+    assert mn % 4 == 0, f'MN must be TMA-aligned for int32 SFs, got {mn}'
+    return pack_ue4m3_to_int(sf).transpose(-1, -2).contiguous().transpose(-1, -2)
 
 
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
@@ -141,3 +201,12 @@ def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128
     group_idx = torch.arange(n, device=packed.device) // gran_k
     x_restored = x_dequantized * sf[:, group_idx]
     return x_restored
+
+
+def cast_back_from_fp8(x_fp8: torch.Tensor, sf: torch.Tensor, gran_k: int = 128,
+                       use_packed_ue8m0: bool = False) -> torch.Tensor:
+    m, n = x_fp8.shape
+    if use_packed_ue8m0:
+        sf = unpack_ue8m0_from_int(sf)
+    group_idx = torch.arange(n, device=x_fp8.device) // gran_k
+    return x_fp8.float() * sf[:, group_idx]
