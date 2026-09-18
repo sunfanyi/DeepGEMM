@@ -10,7 +10,14 @@ from ..utils.math import align
 
 
 class MegaMoEM2NSymmBuffer:
-    """Symmetric storage shared by AG ranks followed by EG ranks."""
+    """Symmetric storage shared by AG ranks followed by EG ranks.
+
+    All ranks construct and destroy buffers in the same order. Keep the buffer
+    alive through all GPU work and graph replays that access it; CUDA IPC needs
+    collective destroy, not garbage collection, while the group is alive.
+    A failed construction invalidates the group and requires all participants
+    to restart; partial-group recovery is not supported.
+    """
 
     def __init__(
         self,
@@ -24,8 +31,6 @@ class MegaMoEM2NSymmBuffer:
         hidden: int,
         intermediate_hidden: int,
     ) -> None:
-        import torch.distributed._symmetric_memory as symm_mem
-
         self.group = group
         self.ag_size = int(ag_size)
         self.eg_size = int(eg_size)
@@ -55,8 +60,30 @@ class MegaMoEM2NSymmBuffer:
             )
         )
         self.num_max_pool_tokens = int(num_max_pool_tokens)
-        self.buffer = symm_mem.empty(int(num_bytes), dtype=torch.int8, device="cuda")
-        self.handle = symm_mem.rendezvous(self.buffer, group=group)
+        self.buffer, local_handle = map(
+            torch.from_dlpack, _C.allocate_m2n_buffer(int(num_bytes))
+        )
+        # Exchange handles within this group, independently of other modules'
+        # Torch symmetric-memory rendezvous history.
+        local_handle = local_handle.to(device=self.buffer.device)
+        handles = torch.empty(
+            (group.size() * local_handle.numel(),),
+            dtype=local_handle.dtype,
+            device=self.buffer.device,
+        )
+        dist.all_gather_into_tensor(handles, local_handle, group=group)
+        handles = handles.cpu().view(group.size(), -1)
+        self._peer_buffers = {
+            rank: torch.from_dlpack(_C.import_m2n_buffer(handle))
+            for rank, handle in enumerate(handles)
+            if rank != group.rank()
+        }
+        self._buffer_ptrs = [
+            (
+                self.buffer if rank == group.rank() else self._peer_buffers[rank]
+            ).data_ptr()
+            for rank in range(group.size())
+        ]
         self.buffer.zero_()
         _C.initialize_symm_buffer_for_mega_moe_m2n(self.buffer, self.group.size())
         self.group.barrier().wait()
@@ -75,16 +102,21 @@ class MegaMoEM2NSymmBuffer:
 
     @property
     def buffer_ptrs(self) -> list[int]:
-        return list(self.handle.buffer_ptrs)
+        return list(self._buffer_ptrs)
 
     @property
     def rank(self) -> int:
         return int(self.group.rank())
 
     def destroy(self) -> None:
-        self.handle = None
-        self.buffer = None
-        self.group = None
+        """Collectively release peer mappings before their owning allocations."""
+        if self.buffer is None:
+            return
+        torch.cuda.synchronize(self.buffer.device)
+        self.group.barrier().wait()
+        self._peer_buffers.clear()
+        self.group.barrier().wait()
+        self._buffer_ptrs = []
         self.x = None
         self.x_sf = None
         self.topk_idx = None
@@ -93,6 +125,8 @@ class MegaMoEM2NSymmBuffer:
         self.l1_acts_sf = None
         self.l2_acts = None
         self.l2_acts_sf = None
+        self.buffer = None
+        self.group = None
 
 
 def get_symm_buffer_for_mega_moe_m2n(

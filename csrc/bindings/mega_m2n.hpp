@@ -1,6 +1,25 @@
 #pragma once
 
 #include "../apis/mega_m2n.hpp"
+#include "../utils/m2n_memory.hpp"
+
+Tuple<Tensor, Tensor> dg_allocate_m2n_buffer(int64_t num_bytes) {
+    auto [buffer, metadata] = m2n_memory::allocate_buffer(num_bytes);
+    return Tuple<Tensor, Tensor>(
+        Tensor::FromDLPack(at::toDLPack(buffer)),
+        Tensor::FromDLPack(at::toDLPack(metadata)));
+}
+
+Tensor dg_import_m2n_buffer(TensorView metadata) {
+    DG_HOST_ASSERT(metadata.device().device_type == kDLCPU);
+    DG_HOST_ASSERT(metadata.dtype().code == kDLInt && metadata.dtype().bits == 64 && metadata.dtype().lanes == 1);
+    DG_HOST_ASSERT(metadata.ndim() == 1 && metadata.size(0) == 10);
+    DG_HOST_ASSERT(!metadata.strides().data() || metadata.strides()[0] == 1);
+    m2n_memory::Metadata values;
+    std::memcpy(values.data(), static_cast<const char*>(metadata.data_ptr()) + metadata.byte_offset(), sizeof(values));
+    auto buffer = m2n_memory::import_buffer(values);
+    return Tensor::FromDLPack(at::toDLPack(buffer));
+}
 
 static std::vector<int64_t> dg_m2n_ptrs_to_vector(
     const Array<int64_t>& pointers) {
@@ -211,6 +230,10 @@ void dg_mega_moe_m2n_eg(
         static_cast<int>(num_sms));
 }
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    allocate_m2n_buffer, dg_allocate_m2n_buffer);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    import_m2n_buffer, dg_import_m2n_buffer);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     get_symm_buffer_size_for_mega_moe_m2n,
     dg_get_symm_buffer_size_for_mega_moe_m2n);

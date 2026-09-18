@@ -181,9 +181,29 @@ def _check_output(actual, expected, ids, label):
 
 
 def run_distributed(use_fp8_weights: bool = False) -> None:
-    dist.init_process_group("nccl", timeout=timedelta(seconds=120))
+    dist.init_process_group(
+        "nccl",
+        timeout=timedelta(seconds=120),
+        device_id=torch.device("cuda", torch.cuda.current_device()),
+    )
     assert dist.get_world_size() == 4, "Use torchrun --nproc_per_node=4 (AG2/EG2)"
     rank, group = dist.get_rank(), dist.group.WORLD
+    # Only AG has a prior rendezvous, as with single-node A CustomAllReduceV2
+    # and cross-node F. M2N must not inherit its process-global exchange index.
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    history_group = dist.new_group(ranks=[0, 1], backend="nccl")
+    history_tensor = history_handle = None
+    if rank < 2:
+        history_tensor = _SymmetricMemory.empty_strided_p2p(
+            (4096,),
+            (1,),
+            torch.uint8,
+            torch.device("cuda", torch.cuda.current_device()),
+            history_group.group_name,
+        )
+        history_handle = _SymmetricMemory.rendezvous(history_tensor)
+    dist.barrier()
     torch.backends.cuda.matmul.allow_tf32 = False
     buffers = [
         get_symm_buffer_for_mega_moe_m2n(
@@ -316,6 +336,9 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
     torch.cuda.synchronize()
     for buffer in buffers:
         buffer.destroy()
+    history_handle = history_tensor = None
+    if rank < 2:
+        dist.destroy_process_group(history_group)
     dist.destroy_process_group()
 
 
