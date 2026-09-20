@@ -28,10 +28,12 @@ get_symm_buffer_size_for_mega_moe_m2n(
     const int& num_max_tokens_per_rank,
     const int& num_topk,
     const int& hidden,
-    const int& intermediate_hidden) {
+    const int& intermediate_hidden,
+    const bool& use_nvfp4) {
     DG_HOST_ASSERT(num_ag_ranks > 0 and num_eg_ranks > 0);
     DG_HOST_ASSERT(num_experts % num_eg_ranks == 0);
-    DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
+    const int block_k = use_nvfp4 ? 256 : 128;
+    DG_HOST_ASSERT(hidden % block_k == 0 and intermediate_hidden % block_k == 0);
 
     const auto workspace = layout::WorkspaceM2N(
         nullptr,
@@ -41,11 +43,13 @@ get_symm_buffer_size_for_mega_moe_m2n(
         num_max_tokens_per_rank,
         num_topk);
 
-    const auto fp8_token_layout = layout::Data(hidden);
+    const int packing = use_nvfp4 ? 2 : 1;
+    const int gran_k = use_nvfp4 ? 16 : 32;
+    const auto fp8_token_layout = layout::Data(hidden / packing);
     const auto bf16_token_layout = layout::Data(hidden * 2);
-    const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
-    const auto fp8_sf_layout = layout::Data(hidden / 32);
-    const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden / 32);
+    const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden / packing);
+    const auto fp8_sf_layout = layout::Data(hidden / gran_k);
+    const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden / gran_k);
     const auto input_topk_idx_layout =
         layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout =
@@ -123,15 +127,15 @@ get_symm_buffer_size_for_mega_moe_m2n(
             math::advance_ptr(
                 buffer.data_ptr(),
                 reinterpret_cast<int64_t>(input_token_buffer.base)),
-            {num_max_tokens_per_rank, hidden},
+            {num_max_tokens_per_rank, hidden / packing},
             torch::TensorOptions()
-                .dtype(torch::kFloat8_e4m3fn)
+                .dtype(use_nvfp4 ? torch::kByte : torch::kFloat8_e4m3fn)
                 .device(buffer.device()));
         auto x_sf = torch::from_blob(
             math::advance_ptr(
                 buffer.data_ptr(),
                 reinterpret_cast<int64_t>(input_sf_buffer.base)),
-            {num_max_tokens_per_rank, hidden / 128},
+            {num_max_tokens_per_rank, hidden / (gran_k * 4)},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
         auto topk_idx = torch::from_blob(
             math::advance_ptr(
@@ -151,30 +155,30 @@ get_symm_buffer_size_for_mega_moe_m2n(
             math::advance_ptr(
                 buffer.data_ptr(),
                 reinterpret_cast<int64_t>(l1_token_buffer.base)),
-            {num_max_pool_tokens, hidden},
+            {num_max_pool_tokens, hidden / packing},
             torch::TensorOptions()
-                .dtype(torch::kFloat8_e4m3fn)
+                .dtype(use_nvfp4 ? torch::kByte : torch::kFloat8_e4m3fn)
                 .device(buffer.device()));
         auto l1_acts_sf = torch::from_blob(
             math::advance_ptr(
                 buffer.data_ptr(),
                 reinterpret_cast<int64_t>(l1_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, hidden / 128},
+            {num_max_padded_sf_pool_tokens, hidden / (gran_k * 4)},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
         auto l2_acts = torch::from_blob(
             math::advance_ptr(
                 buffer.data_ptr(),
                 reinterpret_cast<int64_t>(l2_token_buffer.base)),
-            {num_max_pool_tokens, intermediate_hidden},
+            {num_max_pool_tokens, intermediate_hidden / packing},
             torch::TensorOptions()
-                .dtype(torch::kFloat8_e4m3fn)
+                .dtype(use_nvfp4 ? torch::kByte : torch::kFloat8_e4m3fn)
                 .device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(
                 buffer.data_ptr(),
                 reinterpret_cast<int64_t>(l2_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, intermediate_hidden / 128},
+            {num_max_padded_sf_pool_tokens, intermediate_hidden / (gran_k * 4)},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
         return std::make_tuple(
@@ -224,7 +228,14 @@ static void mega_moe_m2n_ag(
     const int& num_topk,
     const int& intermediate_hidden,
     const float& output_scale,
-    const int& num_sms) {
+    const int& num_sms,
+    const bool& use_nvfp4,
+    const std::optional<torch::Tensor>& input_scale) {
+    if (use_nvfp4) {
+        DG_HOST_ASSERT(input_scale.has_value());
+        DG_HOST_ASSERT(input_scale->is_cuda() and input_scale->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(input_scale->numel() == 1);
+    }
     const auto num_tokens = static_cast<int>(hidden_states.size(0));
     const auto hidden = static_cast<int>(hidden_states.size(1));
     DG_HOST_ASSERT(y.is_cuda() and hidden_states.is_cuda());
@@ -259,7 +270,7 @@ static void mega_moe_m2n_ag(
             num_max_tokens_per_rank,
             num_topk,
             hidden,
-            intermediate_hidden);
+            intermediate_hidden, use_nvfp4);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     const auto [
         x,
@@ -290,7 +301,9 @@ static void mega_moe_m2n_ag(
             static_cast<int>(num_max_pool_tokens),
             static_cast<int>(l1_acts_sf.size(0)),
             output_scale,
-            num_sms);
+            num_sms,
+            use_nvfp4,
+            input_scale.has_value() ? input_scale->const_data_ptr<float>() : nullptr);
         return;
     }
     DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -313,7 +326,11 @@ static void mega_moe_m2n_eg(
     const bool& use_fp8_weights,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const int& num_sms) {
+    const int& num_sms,
+    const bool& use_nvfp4,
+    const std::optional<torch::Tensor>& l1_alphas,
+    const std::optional<torch::Tensor>& l2_alphas,
+    const std::optional<torch::Tensor>& l2_act_scales) {
     const auto num_lanes = static_cast<int>(sym_buffers.size());
     DG_HOST_ASSERT(num_lanes >= 1 and num_lanes <= 4);
     DG_HOST_ASSERT(sym_buffer_ptrs.size() == sym_buffers.size());
@@ -325,6 +342,18 @@ static void mega_moe_m2n_eg(
     DG_HOST_ASSERT(weight_descs.is_contiguous());
     DG_HOST_ASSERT(weight_descs.dim() == 3);
     DG_HOST_ASSERT(weight_descs.size(1) == 4 and weight_descs.size(2) == 128);
+
+    if (use_nvfp4) {
+        DG_HOST_ASSERT(not use_fp8_weights);
+        DG_HOST_ASSERT(l1_alphas.has_value() and l2_alphas.has_value() and l2_act_scales.has_value());
+        for (const auto& scales : {*l1_alphas, *l2_alphas, *l2_act_scales}) {
+            DG_HOST_ASSERT(scales.is_cuda() and scales.scalar_type() == torch::kFloat);
+            DG_HOST_ASSERT(scales.is_contiguous() and scales.size(0) == weight_descs.size(0));
+            DG_HOST_ASSERT(scales.size(1) == num_experts_per_rank);
+        }
+        DG_HOST_ASSERT(l1_alphas->dim() == 3 and l1_alphas->size(2) == 2);
+        DG_HOST_ASSERT(l2_alphas->dim() == 2 and l2_act_scales->dim() == 2);
+    }
 
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
@@ -338,7 +367,7 @@ static void mega_moe_m2n_eg(
             num_max_tokens_per_rank,
             num_topk,
             hidden,
-            intermediate_hidden);
+            intermediate_hidden, use_nvfp4);
 
     std::vector<std::tuple<
         torch::Tensor,
@@ -401,7 +430,11 @@ static void mega_moe_m2n_eg(
             activation_clamp,
             fast_math,
             use_fp8_weights,
-            num_sms);
+            num_sms,
+            use_nvfp4,
+            l1_alphas.has_value() ? l1_alphas->const_data_ptr<float>() : nullptr,
+            l2_alphas.has_value() ? l2_alphas->const_data_ptr<float>() : nullptr,
+            l2_act_scales.has_value() ? l2_act_scales->const_data_ptr<float>() : nullptr);
         return;
     }
     DG_HOST_UNREACHABLE("Unsupported architecture");

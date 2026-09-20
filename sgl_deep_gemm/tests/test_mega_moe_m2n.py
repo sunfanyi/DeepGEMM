@@ -26,6 +26,7 @@ from deep_gemm.utils import (
     cast_back_from_fp4,
     per_token_cast_to_fp4,
     per_token_cast_to_fp8,
+    transform_ue4m3_sf_into_required_layout,
 )
 
 HIDDEN, INTERMEDIATE, EXPERTS, TOPK, CAPACITY = 512, 512, 8, 2, 129
@@ -33,7 +34,7 @@ CLAMP = 1.25
 OUTPUT_SCALES = (1.0, 2.5)
 
 
-def test_layout(capacity: int = 132) -> None:
+def test_layout(capacity: int = 132, use_nvfp4: bool = False) -> None:
     ag_size, eg_size = 2, 2
     num_experts, num_topk = 8, 2
     hidden, intermediate_hidden = 512, 512
@@ -45,6 +46,7 @@ def test_layout(capacity: int = 132) -> None:
         num_topk,
         hidden,
         intermediate_hidden,
+        use_nvfp4,
     )
     buffer = torch.zeros(int(num_bytes), dtype=torch.int8, device="cuda")
     _C.initialize_symm_buffer_for_mega_moe_m2n(buffer, ag_size + eg_size)
@@ -52,14 +54,15 @@ def test_layout(capacity: int = 132) -> None:
     x, x_sf, topk_ids, topk_weights, l1, l1_sf, l2, l2_sf = views
 
     assert int(pool_tokens) > 0
-    assert x.shape == (capacity, hidden)
-    assert x_sf.shape == (capacity, hidden // 128)
+    element_divisor, sf_divisor = (2, 64) if use_nvfp4 else (1, 128)
+    assert x.shape == (capacity, hidden // element_divisor)
+    assert x_sf.shape == (capacity, hidden // sf_divisor)
     assert topk_ids.shape == (capacity, num_topk)
     assert topk_weights.shape == (capacity, num_topk)
-    assert l1.shape == (int(pool_tokens), hidden)
-    assert l2.shape == (int(pool_tokens), intermediate_hidden)
-    assert l1_sf.shape[1] == hidden // 128
-    assert l2_sf.shape[1] == intermediate_hidden // 128
+    assert l1.shape == (int(pool_tokens), hidden // element_divisor)
+    assert l2.shape == (int(pool_tokens), intermediate_hidden // element_divisor)
+    assert l1_sf.shape[1] == hidden // sf_divisor
+    assert l2_sf.shape[1] == intermediate_hidden // sf_divisor
     assert l1_sf.stride() == (1, l1_sf.shape[0])
     assert l2_sf.stride() == (1, l2_sf.shape[0])
 
@@ -72,10 +75,46 @@ def test_layout(capacity: int = 132) -> None:
     assert seeded_words.max().item() == ag_size + eg_size
 
 
-def _make_weights(layer: int, use_fp8_weights: bool = False):
+def _nvfp4_quantize(x):
+    groups = x.float().view(x.shape[0], -1, 16)
+    sf = (groups.abs().amax(dim=-1) * (1.0 / 6.0)).clamp(max=448)
+    sf = sf.to(torch.float8_e4m3fn).float()
+    inv_sf = torch.where(sf > 0, sf.reciprocal(), 0.0)
+    scaled = groups * inv_sf.unsqueeze(-1)
+    magnitude = scaled.abs()
+    codes = torch.zeros_like(scaled, dtype=torch.uint8)
+    # E2M1 RN rounds midpoint ties to the even code, not always downward.
+    for index, boundary in enumerate((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)):
+        codes += (magnitude > boundary) | ((index % 2 == 1) & (magnitude == boundary))
+    codes |= ((scaled < 0) & (codes != 0)).to(torch.uint8) << 3
+    pairs = codes.view(x.shape[0], -1, 2)
+    return (pairs[..., 0] | (pairs[..., 1] << 4)).view(torch.int8), sf
+
+
+def _nvfp4_roundtrip(x):
+    packed, sf = _nvfp4_quantize(x)
+    return cast_back_from_fp4(packed, sf, gran_k=16)
+
+
+def _make_nvfp4_scales(layer):
+    experts = torch.arange(EXPERTS, device="cuda", dtype=torch.float32)
+    input_scale = torch.tensor(2.0 ** (layer + 2), device="cuda")
+    # Different layers, local experts, and gate/up columns expose index errors.
+    l1_scales = torch.stack(
+        (2.0 ** (3 + (experts + layer) % 3), 2.0 ** (5 + (experts + 2 * layer) % 3)),
+        dim=-1,
+    )
+    l2_scales = 2.0 ** (4 + (experts + layer) % 3)
+    l2_act_scales = 2.0 ** ((experts + layer) % 3 - 1)
+    return input_scale, l1_scales, l2_scales, l2_act_scales
+
+
+def _make_weights(layer: int, use_fp8_weights: bool = False, nvfp4_scales=None):
     generator = torch.Generator(device="cuda").manual_seed(100 + layer)
     quantized, reference = [], []
-    for n, k in ((2 * INTERMEDIATE, HIDDEN), (HIDDEN, INTERMEDIATE)):
+    for projection, (n, k) in enumerate(
+        ((2 * INTERMEDIATE, HIDDEN), (HIDDEN, INTERMEDIATE))
+    ):
         raw = (
             torch.randn(
                 (EXPERTS * n, k),
@@ -85,7 +124,20 @@ def _make_weights(layer: int, use_fp8_weights: bool = False):
             )
             * 0.125
         )
-        if use_fp8_weights:
+        gran_k = 32
+        if nvfp4_scales is not None:
+            gran_k = 16
+            _, l1_scales, l2_scales, _ = nvfp4_scales
+            row_scales = (
+                l1_scales.repeat_interleave(INTERMEDIATE, dim=1)
+                if projection == 0
+                else l2_scales[:, None].expand(EXPERTS, HIDDEN)
+            )
+            packed, scales = _nvfp4_quantize(raw.float() * row_scales.reshape(-1, 1))
+            reference.append(
+                cast_back_from_fp4(packed, scales, gran_k=16).view(EXPERTS, n, k)
+            )
+        elif use_fp8_weights:
             blocks = raw.float().view(EXPERTS, n // 128, 128, k // 128, 128)
             scales = blocks.abs().amax(dim=(2, 4)).clamp_min(1e-4) / 448
             scales = torch.exp2(torch.ceil(torch.log2(scales)))
@@ -103,7 +155,7 @@ def _make_weights(layer: int, use_fp8_weights: bool = False):
                 cast_back_from_fp4(packed, scales, gran_k=32).view(EXPERTS, n, k)
             )
         quantized.append(
-            (packed.view(EXPERTS, n, -1), scales.view(EXPERTS, n, k // 32))
+            (packed.view(EXPERTS, n, -1), scales.view(EXPERTS, n, k // gran_k))
         )
     return quantized, reference
 
@@ -113,22 +165,41 @@ def _fp8_roundtrip(x: torch.Tensor) -> torch.Tensor:
     return (packed.float().view(x.shape[0], -1, 32) * scales.unsqueeze(-1)).view_as(x)
 
 
-def _reference(x, ids, weights, layer_weights, output_scale, clamp=CLAMP):
+def _reference(
+    x, ids, weights, layer_weights, output_scale, clamp=CLAMP, nvfp4_scales=None
+):
     # Match the actual quantized operands, not the original BF16 weights.
-    x = _fp8_roundtrip(x.float())
+    if nvfp4_scales is not None:
+        input_scale, l1_scales, l2_scales, l2_act_scales = nvfp4_scales
+        x = _nvfp4_roundtrip(x.float() * input_scale)
+    else:
+        x = _fp8_roundtrip(x.float())
     output = torch.zeros_like(x)
     for expert in range(EXPERTS):
         rows, slots = (ids == expert).nonzero(as_tuple=True)
         if rows.numel() == 0:
             continue
-        gate_up = (x[rows] @ layer_weights[0][expert].T).bfloat16().float()
+        gate_up = x[rows] @ layer_weights[0][expert].T
+        if nvfp4_scales is not None:
+            alphas = (input_scale * l1_scales[expert]).reciprocal()
+            gate_up *= alphas.repeat_interleave(INTERMEDIATE)
+        gate_up = gate_up.bfloat16().float()
         gate, up = gate_up.chunk(2, dim=-1)
         if clamp is not None:
             gate = gate.clamp(max=clamp)
             up = up.clamp(-clamp, clamp)
         activation = (gate / (1 + torch.exp(-gate))) * up
-        activation = _fp8_roundtrip(activation * weights[rows, slots, None])
-        expert_output = (activation @ layer_weights[1][expert].T).bfloat16().float()
+        route_weights = weights[rows, slots, None]
+        if nvfp4_scales is not None:
+            activation = _nvfp4_roundtrip(
+                activation * (route_weights * l2_act_scales[expert])
+            )
+        else:
+            activation = _fp8_roundtrip(activation * route_weights)
+        expert_output = activation @ layer_weights[1][expert].T
+        if nvfp4_scales is not None:
+            expert_output *= (l2_scales[expert] * l2_act_scales[expert]).reciprocal()
+        expert_output = expert_output.bfloat16().float()
         output.index_add_(0, rows, expert_output)
     return (output * output_scale).bfloat16()
 
@@ -180,7 +251,7 @@ def _check_output(actual, expected, ids, label):
     assert relative_rms <= 2**-8, label
 
 
-def run_distributed(use_fp8_weights: bool = False) -> None:
+def run_distributed(use_fp8_weights: bool = False, use_nvfp4: bool = False) -> None:
     dist.init_process_group(
         "nccl",
         timeout=timedelta(seconds=120),
@@ -205,6 +276,7 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
         history_handle = _SymmetricMemory.rendezvous(history_tensor)
     dist.barrier()
     torch.backends.cuda.matmul.allow_tf32 = False
+    mma_type = "nvfp4xnvfp4" if use_nvfp4 else "fp8xfp4"
     buffers = [
         get_symm_buffer_for_mega_moe_m2n(
             group,
@@ -215,13 +287,20 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
             num_topk=TOPK,
             hidden=HIDDEN,
             intermediate_hidden=INTERMEDIATE,
+            mma_type=mma_type,
         )
         for _ in range(3)
     ]
     assert all(buffer.num_max_tokens_per_rank == 132 for buffer in buffers)
-    layers = [_make_weights(layer, use_fp8_weights) for layer in range(2)]
-    clamp = None if use_fp8_weights else CLAMP
+    nvfp4_scales = [
+        _make_nvfp4_scales(layer) if use_nvfp4 else None for layer in range(2)
+    ]
+    layers = [
+        _make_weights(layer, use_fp8_weights, nvfp4_scales[layer]) for layer in range(2)
+    ]
+    clamp = None if use_fp8_weights or use_nvfp4 else CLAMP
     weight_storage, descriptors = [], []
+    l1_alphas = l2_alphas = l2_act_scales = None
     if rank >= 2:
         local_experts = EXPERTS // 2
         start = (rank - 2) * local_experts
@@ -231,15 +310,17 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
                 n = packed.shape[1]
                 k = packed.shape[2] * (1 if use_fp8_weights else 2)
                 packed = packed[start : start + local_experts].contiguous()
-                scales = deep_gemm.transform_sf_into_required_layout(
-                    scales[start : start + local_experts].contiguous(),
-                    n,
-                    k,
-                    (1, 32),
-                    local_experts,
-                )
+                scales = scales[start : start + local_experts].contiguous()
+                if use_nvfp4:
+                    scales = transform_ue4m3_sf_into_required_layout(scales, n)
+                else:
+                    scales = deep_gemm.transform_sf_into_required_layout(
+                        scales, n, k, (1, 32), local_experts
+                    )
                 local_weights.append((packed, scales))
-            transformed = deep_gemm.transform_weights_for_mega_moe(*local_weights)
+            transformed = deep_gemm.transform_weights_for_mega_moe(
+                *local_weights, mma_type=mma_type
+            )
             weight_storage.append(transformed)
             descriptors.append(
                 make_m2n_weight_descs(
@@ -247,9 +328,19 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
                     num_experts_per_rank=local_experts,
                     hidden=HIDDEN,
                     intermediate_hidden=INTERMEDIATE,
+                    mma_type=mma_type,
                 )
             )
         descriptors = torch.stack(descriptors).cuda()
+        if use_nvfp4:
+            local = slice(start, start + local_experts)
+            l1_alphas = torch.stack(
+                [(s[0] * s[1][local]).reciprocal() for s in nvfp4_scales]
+            )
+            l2_alphas = torch.stack(
+                [(s[2][local] * s[3][local]).reciprocal() for s in nvfp4_scales]
+            )
+            l2_act_scales = torch.stack([s[3][local] for s in nvfp4_scales])
     streams = [torch.cuda.Stream() for _ in range(3)] if rank < 2 else []
 
     # Same allocations cross N1/N2/N3 phases, including partial/all-empty lanes
@@ -292,6 +383,9 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
                                 buffers[lane],
                                 output_scale=OUTPUT_SCALES[layer],
                                 num_sms=24,
+                                input_scale=(
+                                    nvfp4_scales[layer][0] if use_nvfp4 else None
+                                ),
                             )
                 for stream in streams[:num_lanes]:
                     torch.cuda.current_stream().wait_stream(stream)
@@ -304,6 +398,9 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
                     use_fp8_weights=use_fp8_weights,
                     activation_clamp=clamp,
                     fast_math=True,
+                    l1_alphas=l1_alphas,
+                    l2_alphas=l2_alphas,
+                    l2_act_scales=l2_act_scales,
                 )
 
         run()
@@ -323,7 +420,11 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
                 for lane in range(num_lanes):
                     data = inputs[layer][lane]
                     expected = _reference(
-                        *data, layers[layer][1], OUTPUT_SCALES[layer], clamp
+                        *data,
+                        layers[layer][1],
+                        OUTPUT_SCALES[layer],
+                        clamp,
+                        nvfp4_scales[layer],
                     )
                     _check_output(
                         outputs[layer][lane],
@@ -344,14 +445,16 @@ def run_distributed(use_fp8_weights: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fp8", action="store_true")
+    quantization = parser.add_mutually_exclusive_group()
+    quantization.add_argument("--fp8", action="store_true")
+    quantization.add_argument("--nvfp4", action="store_true")
     parser.add_argument("--hidden", type=int, default=HIDDEN)
     parser.add_argument("--intermediate", type=int, default=INTERMEDIATE)
     args = parser.parse_args()
     HIDDEN, INTERMEDIATE = args.hidden, args.intermediate
     if int(os.environ.get("WORLD_SIZE", "1")) == 1:
         for capacity in (4, 128, 132):
-            test_layout(capacity)
+            test_layout(capacity, use_nvfp4=args.nvfp4)
     else:
-        run_distributed(use_fp8_weights=args.fp8)
+        run_distributed(use_fp8_weights=args.fp8, use_nvfp4=args.nvfp4)
     print("OK")

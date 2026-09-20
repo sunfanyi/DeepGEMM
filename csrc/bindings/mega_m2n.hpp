@@ -50,7 +50,8 @@ dg_get_symm_buffer_size_for_mega_moe_m2n(
     int64_t num_max_tokens_per_rank,
     int64_t num_topk,
     int64_t hidden,
-    int64_t intermediate_hidden) {
+    int64_t intermediate_hidden,
+    bool use_nvfp4) {
     auto [num_bytes, num_max_pool_tokens, slice] =
         mega_m2n::get_symm_buffer_size_for_mega_moe_m2n(
             static_cast<int>(num_ag_ranks),
@@ -59,7 +60,7 @@ dg_get_symm_buffer_size_for_mega_moe_m2n(
             static_cast<int>(num_max_tokens_per_rank),
             static_cast<int>(num_topk),
             static_cast<int>(hidden),
-            static_cast<int>(intermediate_hidden));
+            static_cast<int>(intermediate_hidden), use_nvfp4);
 
     auto slice_input_buffers = [=](TensorView buffer) {
         auto [
@@ -128,7 +129,9 @@ void dg_mega_moe_m2n_ag(
     int64_t num_topk,
     int64_t intermediate_hidden,
     double output_scale,
-    int64_t num_sms) {
+    int64_t num_sms,
+    bool use_nvfp4,
+    Optional<TensorView> input_scale) {
     mega_m2n::mega_moe_m2n_ag(
         convert_to_torch_tensor(y),
         convert_to_torch_tensor(hidden_states),
@@ -144,7 +147,11 @@ void dg_mega_moe_m2n_ag(
         static_cast<int>(num_topk),
         static_cast<int>(intermediate_hidden),
         static_cast<float>(output_scale),
-        static_cast<int>(num_sms));
+        static_cast<int>(num_sms),
+        use_nvfp4,
+        input_scale.has_value()
+            ? std::optional<torch::Tensor>(convert_to_torch_tensor(input_scale.value()))
+            : std::nullopt);
 }
 
 Tensor dg_make_m2n_weight_descs(
@@ -154,7 +161,8 @@ Tensor dg_make_m2n_weight_descs(
     TensorView l2_weights_sf,
     int64_t num_experts_per_rank,
     int64_t hidden,
-    int64_t intermediate_hidden) {
+    int64_t intermediate_hidden,
+    bool use_nvfp4) {
     auto result = make_m2n_weight_descs(
         convert_to_torch_tensor(l1_weights),
         convert_to_torch_tensor(l1_weights_sf),
@@ -162,7 +170,7 @@ Tensor dg_make_m2n_weight_descs(
         convert_to_torch_tensor(l2_weights_sf),
         static_cast<int>(num_experts_per_rank),
         static_cast<int>(hidden),
-        static_cast<int>(intermediate_hidden));
+        static_cast<int>(intermediate_hidden), use_nvfp4);
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
@@ -190,7 +198,11 @@ void dg_mega_moe_m2n_eg(
     bool use_fp8_weights,
     Optional<double> activation_clamp,
     bool fast_math,
-    int64_t num_sms) {
+    int64_t num_sms,
+    bool use_nvfp4,
+    Optional<TensorView> l1_alphas,
+    Optional<TensorView> l2_alphas,
+    Optional<TensorView> l2_act_scales) {
     const std::vector<torch::Tensor> sym_buffers = {
         convert_to_torch_tensor(sym_buffer0),
         convert_to_torch_tensor(sym_buffer1),
@@ -227,7 +239,17 @@ void dg_mega_moe_m2n_eg(
         use_fp8_weights,
         activation_clamp_value,
         fast_math,
-        static_cast<int>(num_sms));
+        static_cast<int>(num_sms),
+        use_nvfp4,
+        l1_alphas.has_value()
+            ? std::optional<torch::Tensor>(convert_to_torch_tensor(l1_alphas.value()))
+            : std::nullopt,
+        l2_alphas.has_value()
+            ? std::optional<torch::Tensor>(convert_to_torch_tensor(l2_alphas.value()))
+            : std::nullopt,
+        l2_act_scales.has_value()
+            ? std::optional<torch::Tensor>(convert_to_torch_tensor(l2_act_scales.value()))
+            : std::nullopt);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(

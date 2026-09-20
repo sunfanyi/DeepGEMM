@@ -30,7 +30,11 @@ class MegaMoEM2NSymmBuffer:
         num_topk: int,
         hidden: int,
         intermediate_hidden: int,
+        mma_type: str = "fp8xfp4",
     ) -> None:
+        if mma_type not in ("fp8xfp4", "nvfp4xnvfp4"):
+            raise ValueError(f"Unsupported M2N MMA type: {mma_type}")
+        self.mma_type = mma_type
         self.group = group
         self.ag_size = int(ag_size)
         self.eg_size = int(eg_size)
@@ -57,6 +61,7 @@ class MegaMoEM2NSymmBuffer:
                 self.num_topk,
                 self.hidden,
                 self.intermediate_hidden,
+                self.mma_type == "nvfp4xnvfp4",
             )
         )
         self.num_max_pool_tokens = int(num_max_pool_tokens)
@@ -139,6 +144,7 @@ def get_symm_buffer_for_mega_moe_m2n(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    mma_type: str = "fp8xfp4",
 ) -> MegaMoEM2NSymmBuffer:
     return MegaMoEM2NSymmBuffer(
         group,
@@ -149,6 +155,7 @@ def get_symm_buffer_for_mega_moe_m2n(
         num_topk=num_topk,
         hidden=hidden,
         intermediate_hidden=intermediate_hidden,
+        mma_type=mma_type,
     )
 
 
@@ -161,8 +168,13 @@ def mega_moe_m2n_ag(
     *,
     output_scale: float = 1.0,
     num_sms: int = 0,
+    input_scale: Optional[torch.Tensor] = None,
 ) -> None:
-    """Run fused AG quantize, dispatch, combine, and output reduction."""
+    """Run fused AG quantize, dispatch, combine, and output reduction.
+
+    NVFP4 requires a CUDA FP32 scalar ``input_scale`` multiplying the input
+    before quantization; its inverse must be folded into EG ``l1_alphas``.
+    """
     _C.mega_moe_m2n_ag(
         y,
         hidden_states,
@@ -179,6 +191,8 @@ def mega_moe_m2n_ag(
         sym_buffer.intermediate_hidden,
         float(output_scale),
         int(num_sms),
+        sym_buffer.mma_type == "nvfp4xnvfp4",
+        input_scale,
     )
 
 
@@ -189,6 +203,7 @@ def make_m2n_weight_descs(
     num_experts_per_rank: int,
     hidden: int,
     intermediate_hidden: int,
+    mma_type: str = "fp8xfp4",
 ) -> torch.Tensor:
     """Build one layer's config-independent ``[4, 128]`` descriptor blob."""
     return torch.from_dlpack(
@@ -200,6 +215,7 @@ def make_m2n_weight_descs(
             int(num_experts_per_rank),
             int(hidden),
             int(intermediate_hidden),
+            mma_type == "nvfp4xnvfp4",
         )
     )
 
@@ -214,8 +230,17 @@ def mega_moe_m2n_eg(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     num_sms: int = 0,
+    l1_alphas: Optional[torch.Tensor] = None,
+    l2_alphas: Optional[torch.Tensor] = None,
+    l2_act_scales: Optional[torch.Tensor] = None,
 ) -> None:
-    """Run persistent EG receive, expert MLP, and response for one to four lanes."""
+    """Run persistent EG receive, expert MLP, and response for one to four lanes.
+
+    NVFP4 requires contiguous CUDA FP32 tables: ``l1_alphas`` [layers, experts, 2]
+    for gate/up, and ``l2_alphas`` / ``l2_act_scales`` [layers, experts]. Alphas
+    multiply the FP32 accumulators; ``l2_act_scales`` multiplies SwiGLU before
+    quantization, and its inverse must be folded into ``l2_alphas``.
+    """
     if not 1 <= len(sym_buffers) <= 4:
         raise ValueError("sym_buffers must contain between one and four lanes")
 
@@ -225,6 +250,7 @@ def mega_moe_m2n_eg(
             sym_buffer.group is not first.group
             or sym_buffer.ag_size != first.ag_size
             or sym_buffer.eg_size != first.eg_size
+            or sym_buffer.mma_type != first.mma_type
             or sym_buffer.num_experts != first.num_experts
             or sym_buffer.num_topk != first.num_topk
             or sym_buffer.hidden != first.hidden
@@ -253,4 +279,8 @@ def mega_moe_m2n_eg(
         activation_clamp,
         bool(fast_math),
         int(num_sms),
+        first.mma_type == "nvfp4xnvfp4",
+        l1_alphas,
+        l2_alphas,
+        l2_act_scales,
     )
