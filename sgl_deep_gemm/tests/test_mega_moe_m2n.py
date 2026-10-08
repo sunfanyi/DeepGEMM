@@ -37,7 +37,7 @@ OUTPUT_SCALES = (1.0, 2.5)
 def test_layout(capacity: int = 132, use_nvfp4: bool = False) -> None:
     ag_size, eg_size = 2, 2
     num_experts, num_topk = 8, 2
-    hidden, intermediate_hidden = 512, 512
+    hidden, intermediate_hidden = HIDDEN, INTERMEDIATE
     num_bytes, pool_tokens, slice_buffers = _C.get_symm_buffer_size_for_mega_moe_m2n(
         ag_size,
         eg_size,

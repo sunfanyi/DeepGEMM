@@ -49,7 +49,9 @@ get_symm_buffer_size_for_mega_moe_m2n(
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden / packing);
     const auto fp8_sf_layout = layout::Data(hidden / gran_k);
-    const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden / gran_k);
+    // Pad the allocation tail, not the M-major scale stride.
+    const auto fp8_intermediate_sf_layout = layout::Data(
+        math::align(intermediate_hidden / gran_k, 16));
     const auto input_topk_idx_layout =
         layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout =

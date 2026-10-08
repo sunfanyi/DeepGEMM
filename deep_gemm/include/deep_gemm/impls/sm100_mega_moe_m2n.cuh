@@ -115,7 +115,9 @@ sm100_mega_moe_m2n_ag_impl(void* y,
     constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
     constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden / kPacking);
     constexpr auto fp8_sf_layout = layout::Data(kHidden / kGranK);
-    constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / kGranK);
+    // Pad the allocation tail, not the M-major scale stride.
+    constexpr auto fp8_intermediate_sf_layout = layout::Data(
+        math::constexpr_align(kIntermediateHidden / kGranK, 16u));
     constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
     constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
     constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
@@ -607,7 +609,9 @@ sm100_mega_moe_m2n_eg_impl(
     constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
     constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden / kPacking);
     constexpr auto fp8_sf_layout = layout::Data(kHidden / kGranK);
-    constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / kGranK);
+    // Pad the allocation tail, not the M-major scale stride.
+    constexpr auto fp8_intermediate_sf_layout = layout::Data(
+        math::constexpr_align(kIntermediateHidden / kGranK, 16u));
     constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
     constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
     constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
