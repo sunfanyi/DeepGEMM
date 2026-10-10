@@ -3,9 +3,14 @@
 # Runs from sgl_deep_gemm/tests/ so `import deep_gemm` hits the wheel's prebuilt _C.so, not
 # the source tree (which JIT-rebuilds _C); the guard below aborts if that resolution is wrong.
 #
-# Usage: run_tests.sh [DEEPGEMM_SRC] [--max-procs N] [--skip-sanitizer] [--skip-mega-moe]
+# Usage: run_tests.sh [DEEPGEMM_SRC] [--release] [--max-procs N] [--skip-sanitizer] [--skip-mega-moe]
 #   DEEPGEMM_SRC defaults to this script's own repo root.
+#   --release selects bounded attention coverage and focused sanitizer functions.
 set -uo pipefail
+
+# TVM FFI probes CUDA availability while loading Torch's DLPack fast path.
+# NVML discovery avoids creating a CUDA context before fork-based tests.
+export PYTORCH_NVML_BASED_CUDA_CHECK="${PYTORCH_NVML_BASED_CUDA_CHECK-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEEPGEMM_SRC="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -15,14 +20,21 @@ fi
 MAX_PROCS=""
 SKIP_SANITIZER=0
 SKIP_MEGA_MOE=0
+TEST_PROFILE=full
 while [ $# -gt 0 ]; do
   case "$1" in
+    --release) TEST_PROFILE=release; shift ;;
     --max-procs) MAX_PROCS="$2"; shift 2 ;;
     --skip-sanitizer) SKIP_SANITIZER=1; shift ;;
     --skip-mega-moe) SKIP_MEGA_MOE=1; shift ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+export DG_TEST_PROFILE="${TEST_PROFILE}"
+if [ "${TEST_PROFILE}" = release ] && [ "${DG_MQA_NUM_CASES+x}" = x ]; then
+  echo "--release cannot be combined with DG_MQA_NUM_CASES; unset the random sampling cap." >&2
+  exit 1
+fi
 
 TESTS_DIR="${DEEPGEMM_SRC}/sgl_deep_gemm/tests"
 PYTHON="${PYTHON:-python3}"
@@ -64,6 +76,10 @@ echo " DeepGEMM wheel test run"
 echo "   deep_gemm:    ${DG_FILE}"
 echo "   GPUs:         ${NUM_GPUS} (compute_cap ${COMPUTE_CAP}, arch major ${ARCH_MAJOR})"
 echo "   processes:    ${NPROC}"
+echo "   profile:      ${TEST_PROFILE}"
+if [ "${TEST_PROFILE}" = release ]; then
+  echo "   coverage:     reduced attention matrix and focused memcheck/synccheck"
+fi
 echo "   skip-mega:    ${SKIP_MEGA_MOE}   skip-sanitizer: ${SKIP_SANITIZER}"
 echo "=============================================================="
 
@@ -75,13 +91,8 @@ run_test() {
   local name="$1"; shift
   echo ""
   echo "----- RUN ${name} $* -----"
-  local launch=("${PYTHON}")
-  if [ "${1:-}" = "--distributed" ]; then
-    shift
-    launch+=(-m torch.distributed.run --standalone --nproc_per_node=4)
-  fi
   local log; log=$(mktemp)
-  (cd "${TESTS_DIR}" && "${launch[@]}" "${name}" "$@") 2>&1 | tee "${log}"
+  (cd "${TESTS_DIR}" && "${PYTHON}" -u "${name}" "$@") 2>&1 | tee "${log}"
   local rc=${PIPESTATUS[0]}
   # Fork-based multiprocessing tests can crash in child processes while the
   # launcher still exits 0; treat an unhandled traceback as a failure too.
@@ -104,8 +115,6 @@ skip_test() {
   SKIPPED+=("$1 ($2)")
 }
 
-# test_legacy.py is intentionally excluded: the deep_gemm.legacy kernels are
-# deprecated and not exposed by the wheel.
 DEFAULT_SINGLE_GPU_TESTS=(
   test_bf16.py
   test_einsum.py
@@ -113,6 +122,7 @@ DEFAULT_SINGLE_GPU_TESTS=(
   test_hyperconnection.py
   test_layout.py
   test_attention.py
+  test_legacy.py
 )
 SM120_SINGLE_GPU_TESTS=(
   test_bf16.py
@@ -123,6 +133,7 @@ SM120_SINGLE_GPU_TESTS=(
 SM120_UNSUPPORTED_SINGLE_GPU_TESTS=(
   test_hyperconnection.py
   test_layout.py
+  test_legacy.py
 )
 
 if [ "${ARCH_MAJOR}" -eq 12 ]; then
@@ -139,17 +150,22 @@ for t in "${SINGLE_GPU_TESTS[@]}"; do
   fi
 done
 
+for t in test_mega_gate.py test_mega_mhc.py test_clean_logits_bounds.py; do
+  if [ "${ARCH_MAJOR}" -eq 10 ]; then
+    run_test "${t}"
+  else
+    skip_test "${t}" "SM100-only, arch major ${ARCH_MAJOR}"
+  fi
+done
+
 if [ "${ARCH_MAJOR}" -eq 12 ]; then
   for t in "${SM120_UNSUPPORTED_SINGLE_GPU_TESTS[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "not supported on SM120"
   done
 fi
 
-# test_lazy_init.py is intentionally excluded: `import tvm_ffi` eagerly creates a
-# CUDA context, so `import deep_gemm` trips torch's bad-fork guard. Tracked
-# upstream in apache-tvm-ffi; re-enable once import no longer initializes CUDA.
 if [ -f "${TESTS_DIR}/test_lazy_init.py" ]; then
-  skip_test test_lazy_init.py "tvm_ffi eager CUDA init (upstream)"
+  run_test test_lazy_init.py --num-processes "${NPROC}"
 fi
 
 # mega_moe family covers Blackwell fp4 + symmetric-memory kernels and the SM90
@@ -158,7 +174,7 @@ fi
 # pre_dispatch tests use deep_gemm's own symmetric buffer.
 MEGA_MOE_BLACKWELL=(
   test_mega_moe.py
-  test_mega_moe_m2n.py
+  test_mega_moe_sgl.py
   test_mega_moe_situ.py
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
@@ -182,23 +198,21 @@ elif [ "${ARCH_MAJOR}" -eq 12 ]; then
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "not supported on SM120"
   done
 elif [ "${ARCH_MAJOR}" -ge 10 ]; then
-  if [ "${ARCH_MAJOR}" -eq 10 ]; then
-    run_test test_mega_moe_m2n.py
-    if [ "${NPROC}" -ge 4 ]; then
-      run_test test_mega_moe_m2n.py --distributed
-      run_test test_mega_moe_m2n.py --distributed --fp8
-    else
-      skip_test "test_mega_moe_m2n.py AG2/EG2" "requires four GPUs"
-    fi
-  else
-    skip_test test_mega_moe_m2n.py "requires SM100 or SM103"
-  fi
   if [ -f "${TESTS_DIR}/test_mega_moe.py" ]; then
     if (cd "${TESTS_DIR}" && "${PYTHON}" -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer')") >/dev/null 2>&1; then
       run_test test_mega_moe.py --num-processes "${NPROC}"
+      if [ "${NPROC}" -ge 2 ]; then
+        run_test test_mega_moe.py --num-processes 2 --mma-type bf16xbf16 \
+          --num-tokens 2048 --num-max-tokens-per-rank 2048 --hidden 1024 \
+          --intermediate-hidden 512 --num-experts 8 --num-topk 2 --num-shared-experts 0 \
+          --num-correctness-tests 1 --num-graph-correctness-tests 24
+      fi
     else
       skip_test test_mega_moe.py "deep_ep with ElasticBuffer not installed"
     fi
+  fi
+  if [ -f "${TESTS_DIR}/test_mega_moe_sgl.py" ]; then
+    run_test test_mega_moe_sgl.py --num-processes "${NPROC}"
   fi
   [ -f "${TESTS_DIR}/test_mega_moe_situ.py" ] && run_test test_mega_moe_situ.py --num-processes 1
   L1_NPROC="${NPROC}"
@@ -208,6 +222,11 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   for t in test_mega_moe_l1_fp4_accuracy.py test_mega_moe_l1_sentinel.py; do
     [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${L1_NPROC}"
   done
+  if [ "${NPROC}" -ge 2 ]; then
+    run_test test_mega_moe_nvfp4_alphas.py --num-processes "${L1_NPROC}"
+  else
+    skip_test test_mega_moe_nvfp4_alphas.py "requires at least 2 ranks"
+  fi
   [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
   for t in "${MEGA_MOE_HOPPER[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "SM90-only, arch major ${ARCH_MAJOR}"
@@ -219,15 +238,23 @@ else
   for t in "${MEGA_MOE_HOPPER[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${NPROC}"
   done
+  run_test test_mega_moe_hopper.py --num-processes "${NPROC}" \
+    --accuracy --layers 1 2 3 4 5 --num-correctness-tests 32
 fi
 
-# test_sanitizer.py is intentionally excluded: compute-sanitizer memcheck/synccheck
-# are clean, but its DG_JIT_PTXAS_CHECK trips on a register spill ("Local memory
-# used") in fp8_fp4_mqa_logits — a perf/codegen finding, not a memory-safety bug.
-# Re-enable once that kernel's register pressure is addressed or the check is
-# scoped to allow it.
 if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then
-  skip_test test_sanitizer.py "fp8_fp4_mqa_logits register spill (known)"
+  if [ "${SKIP_SANITIZER}" -eq 1 ]; then
+    skip_test test_sanitizer.py "--skip-sanitizer"
+  elif [ "${TEST_PROFILE}" = release ]; then
+    # Keep both tools, but avoid instrumenting every benchmark Cartesian product.
+    SANITIZER_FUNCS=test_attention.test_gemm_skip_head_mid
+    if [ "${ARCH_MAJOR}" -eq 10 ]; then
+      SANITIZER_FUNCS+=,test_clean_logits_bounds.test_clean_logits_bounds
+    fi
+    run_test test_sanitizer.py --funcs "${SANITIZER_FUNCS}" --tools memcheck,synccheck
+  else
+    run_test test_sanitizer.py
+  fi
 fi
 
 echo ""

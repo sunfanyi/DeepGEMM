@@ -10,7 +10,7 @@
 
 #include "../utils/compatibility.hpp"
 #include "../utils/math.hpp"
-#include "../jit/device_runtime.hpp"
+#include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_mega_moe_m2n.hpp"
 
 namespace deep_gemm::mega_m2n {
@@ -284,7 +284,7 @@ static void mega_moe_m2n_ag(
         l2_acts,
         l2_acts_sf] = slice(sym_buffer);
 
-    if (device_runtime->get_arch_major() == 10) {
+    if (jit->device.get_arch_major() == 10) {
         sm100_mega_moe_m2n_ag(
             y,
             hidden_states,
@@ -395,7 +395,7 @@ static void mega_moe_m2n_eg(
         views.push_back(views.front());
     }
 
-    if (device_runtime->get_arch_major() == 10) {
+    if (jit->device.get_arch_major() == 10) {
         sm100_mega_moe_m2n_eg(
             std::get<4>(views[0]),
             std::get<5>(views[0]),

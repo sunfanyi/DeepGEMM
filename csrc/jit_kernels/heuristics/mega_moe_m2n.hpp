@@ -7,7 +7,9 @@
 
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
-#include "../../utils/system.hpp"
+#include <deep_jit/utils/env.hpp>
+#include <format>
+#include <iostream>
 #include "sm100.hpp"
 
 namespace deep_gemm {
@@ -173,8 +175,8 @@ static MegaMoEM2NConfig get_mega_moe_m2n_config(
     };
 
     // Print configs for the first time
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        const auto key = fmt::format(
+    if (deep_jit::get_env<int>("DG_JIT_DEBUG") or deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+        const auto key = std::format(
             "MegaMoEM2NConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, use_nvfp4={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk, use_nvfp4);
         static std::unordered_set<std::string> printed;

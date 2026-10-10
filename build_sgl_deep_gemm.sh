@@ -6,7 +6,7 @@
 # (so existing call sites like `import deep_gemm` in sglang keep working).
 #
 # Build flow:
-#   1. Initialises submodules (cutlass, fmt) — same prerequisite as `bash build.sh`.
+#   1. Initialises submodules (cutlass, deep_jit) — same prerequisite as `bash build.sh`.
 #   2. Stages the package layout under build/deep_gemm/ with the Python
 #      sub-modules pulled from the source deep_gemm/ tree (utils, testing,
 #      legacy, mega).
@@ -30,7 +30,9 @@ if [[ ! -f "setup.py" || ! -d "sgl_deep_gemm" || ! -d "deep_gemm" || ! -d "csrc"
 fi
 
 echo "--- Initialising submodules ---"
-git submodule update --init --recursive
+if [[ ! -f third-party/cutlass/include/cutlass/cutlass.h || ! -f third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp ]]; then
+    git submodule update --init --recursive
+fi
 
 echo "--- Linking CUTLASS headers into deep_gemm/include ---"
 ln -sfn "${ROOT_DIR}/third-party/cutlass/include/cutlass" "${ROOT_DIR}/deep_gemm/include/cutlass"
@@ -40,7 +42,7 @@ echo "--- Preparing build directory ---"
 rm -rf "$BUILD_DIR"
 mkdir -p "$PKG_DIR"
 
-cp sgl_deep_gemm/LICENSE sgl_deep_gemm/README.md sgl_deep_gemm/pyproject.toml "$BUILD_DIR/"
+cp sgl_deep_gemm/LICENSE sgl_deep_gemm/README.md sgl_deep_gemm/pyproject.toml sgl_deep_gemm/setup.py "$BUILD_DIR/"
 cp sgl_deep_gemm/__init__.py sgl_deep_gemm/cuda_helpers.py "$PKG_DIR/"
 
 # `__init__.py` imports `.utils`, `.testing`, `.legacy`, `.mega` — pulled from
@@ -54,6 +56,7 @@ mkdir -p "$PKG_DIR/include"
 cp -r "${ROOT_DIR}/deep_gemm/include/deep_gemm" "$PKG_DIR/include/deep_gemm"
 cp -r "${ROOT_DIR}/third-party/cutlass/include/cute" "$PKG_DIR/include/cute"
 cp -r "${ROOT_DIR}/third-party/cutlass/include/cutlass" "$PKG_DIR/include/cutlass"
+cp -r "${ROOT_DIR}/third-party/deep_jit/include/deep_jit" "$PKG_DIR/include/deep_jit"
 
 echo "--- Reading version from sgl_deep_gemm/VERSION ---"
 if [[ ! -f "sgl_deep_gemm/VERSION" ]]; then
@@ -100,7 +103,7 @@ os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', cuda_helpers.get_cuda_arch())
 
 cxx_abi = int(torch.compiled_with_cxx11_abi())
 extra_cflags = [
-    '-std=c++17', '-O3', '-fPIC',
+    '-std=c++20', '-O3', '-fPIC',
     '-Wno-psabi', '-Wno-deprecated-declarations',
     f'-D_GLIBCXX_USE_CXX11_ABI={cxx_abi}',
 ]
@@ -115,7 +118,7 @@ extra_include_paths = [
     os.path.join(torch_dir, 'include', 'torch', 'csrc', 'api', 'include'),
     os.path.join(root_dir, 'deep_gemm', 'include'),
     os.path.join(root_dir, 'third-party', 'cutlass', 'include'),
-    os.path.join(root_dir, 'third-party', 'fmt', 'include'),
+    os.path.join(root_dir, 'third-party', 'deep_jit', 'include'),
 ]
 cccl = f'{cuda_home}/include/cccl'
 if os.path.exists(cccl):

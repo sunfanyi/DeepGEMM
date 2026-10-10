@@ -2,10 +2,9 @@
 
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/launch.hpp"
+#include <format>
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "runtime_utils.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
@@ -19,7 +18,7 @@ namespace deep_gemm {
 // ---------------------------------------------------------------------------
 // AG kernel runtime (send + recv only; no GEMM, no cluster)
 // ---------------------------------------------------------------------------
-class SM100MegaMoEM2NAGRuntime final : public LaunchRuntime<SM100MegaMoEM2NAGRuntime> {
+class SM100MegaMoEM2NAGRuntime final {
 public:
     struct Args {
         int num_max_tokens_per_rank;
@@ -41,11 +40,11 @@ public:
         float output_scale;
         layout::SymBuffer<> sym_buffer_ptrs;
 
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_options;
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_mega_moe_m2n.cuh>
 
 using namespace deep_gemm;
@@ -75,8 +74,8 @@ static void __instantiate_kernel() {{
     args.use_nvfp4 ? "true" : "false");
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_options,
             args.y,
             static_cast<const nv_bfloat16*>(args.hidden_ptr),
             args.topk_ids_ptr,
@@ -85,7 +84,7 @@ static void __instantiate_kernel() {{
             args.output_scale,
             args.input_scale,
             args.sym_buffer_ptrs
-        ));
+        );
     }
 };
 
@@ -123,8 +122,8 @@ static void sm100_mega_moe_m2n_ag(
     constexpr int kNumDispatchThreads = 128;
     constexpr int kNumCombineThreads = 256;
     const auto num_sms = num_sms_opt > 0
-        ? std::min(num_sms_opt, device_runtime->get_num_sms())
-        : device_runtime->get_num_sms();
+        ? std::min(num_sms_opt, jit->device.get_num_sms())
+        : jit->device.get_num_sms();
     const auto [num_chunks, smem_size] = get_ag_combine_smem_config_m2n(
         hidden, num_experts, kNumCombineThreads);
 
@@ -148,20 +147,20 @@ static void sm100_mega_moe_m2n_ag(
         .num_tokens = num_tokens,
         .output_scale = output_scale,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
-        .launch_args = LaunchArgs(num_sms,
+        .launch_options = make_launch_options(num_sms,
                                   kNumDispatchThreads + kNumCombineThreads,
                                   smem_size, 1)
     };
 
-    const auto code = SM100MegaMoEM2NAGRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_mega_moe_m2n_ag", code);
-    SM100MegaMoEM2NAGRuntime::launch(runtime, args);
+    const auto code = SM100MegaMoEM2NAGRuntime::generate_impl(args);
+    const auto kernel = jit->compile("sm100_mega_moe_m2n_ag", code);
+    SM100MegaMoEM2NAGRuntime::launch(kernel, args);
 }
 
 // ---------------------------------------------------------------------------
 // EG kernel runtime (recv + experts + send)
 // ---------------------------------------------------------------------------
-class SM100MegaMoEM2NEGRuntime final : public LaunchRuntime<SM100MegaMoEM2NEGRuntime> {
+class SM100MegaMoEM2NEGRuntime final {
 public:
     struct Args {
         int num_max_tokens_per_rank;
@@ -206,11 +205,11 @@ public:
         const void* weight_descs;       // gmem [num_layers][4] CUtensorMap
         int num_layers;
 
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_options;
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_mega_moe_m2n.cuh>
 
 using namespace deep_gemm;
@@ -249,7 +248,7 @@ static void __instantiate_kernel() {{
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.config.num_dispatch_pull_stages,
-    args.launch_args.grid_dim.first,
+    args.launch_options.grid_dim->x,
     args.num_ag_ranks, args.num_eg_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
@@ -258,8 +257,8 @@ static void __instantiate_kernel() {{
     args.use_nvfp4 ? "true" : "false");
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_options,
             args.sym_buffer_ptrs,
             args.sym_buffer_ptrs1,
             args.sym_buffer_ptrs2,
@@ -289,7 +288,7 @@ static void __instantiate_kernel() {{
             args.l1_alphas,
             args.l2_alphas,
             args.l2_act_scales
-        ));
+        );
     }
 };
 
@@ -370,8 +369,8 @@ static void sm100_mega_moe_m2n_eg(
     // A sub-device grid lets two microbatch lanes co-run their fused kernels;
     // 2-CTA clusters require an even SM count.
     auto num_sms = num_sms_opt > 0
-        ? std::min(num_sms_opt, device_runtime->get_num_sms())
-        : device_runtime->get_num_sms();
+        ? std::min(num_sms_opt, jit->device.get_num_sms())
+        : jit->device.get_num_sms();
     num_sms = std::max(num_sms / 2 * 2, 4);
 
     // Fixed M64 and full expert waves avoid routing-sensitive small-block regressions.
@@ -520,14 +519,14 @@ static void sm100_mega_moe_m2n_eg(
         .tensor_map_l2_acts_sf_3 = tensor_map_l2_acts_sf_3,
         .weight_descs = weight_descs.data_ptr(),
         .num_layers = num_layers,
-        .launch_args = LaunchArgs(num_sms,
+        .launch_options = make_launch_options(num_sms,
                                   config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, 2)
     };
 
-    const auto code = SM100MegaMoEM2NEGRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_mega_moe_m2n_eg", code);
-    SM100MegaMoEM2NEGRuntime::launch(runtime, args);
+    const auto code = SM100MegaMoEM2NEGRuntime::generate_impl(args);
+    const auto kernel = jit->compile("sm100_mega_moe_m2n_eg", code);
+    SM100MegaMoEM2NEGRuntime::launch(kernel, args);
 }
 
 } // namespace deep_gemm

@@ -8,7 +8,8 @@
 
 #include <torch/torch.h>
 
-#include "../jit/handle.hpp"
+#include <deep_jit/backend/cuda/driver.hpp>
+#include "exception.hpp"
 
 namespace deep_gemm::m2n_memory {
 
@@ -16,17 +17,17 @@ enum class HandleKind : int64_t { Fabric = 1, Ipc = 2 };
 using Metadata = std::array<int64_t, 10>;
 
 #if CUDA_VERSION >= 12030
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuDeviceGetAttribute);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemGetAllocationGranularity);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemCreate);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemExportToShareableHandle);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemImportFromShareableHandle);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemAddressReserve);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemMap);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemSetAccess);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemUnmap);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemAddressFree);
-DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemRelease);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuDeviceGetAttribute);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemGetAllocationGranularity);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemCreate);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemExportToShareableHandle);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemImportFromShareableHandle);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemAddressReserve);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemMap);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemSetAccess);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemUnmap);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemAddressFree);
+DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemRelease);
 #endif
 
 inline void report_cleanup_error(cudaError_t result, const char* operation) noexcept {
@@ -109,20 +110,20 @@ inline bool fabric_unavailable(CUresult result) {
 
 inline void map_fabric(Allocation& allocation) {
     CUdeviceptr address = 0;
-    DG_CUDA_DRIVER_CHECK(lazy_cuMemAddressReserve(&address, allocation.size, 0, 0, 0));
+    DJ_CUDA_DRIVER_CHECK(lazy_cuMemAddressReserve(&address, allocation.size, 0, 0, 0));
     allocation.pointer = reinterpret_cast<void*>(address);
-    DG_CUDA_DRIVER_CHECK(lazy_cuMemMap(address, allocation.size, 0, allocation.handle, 0));
+    DJ_CUDA_DRIVER_CHECK(lazy_cuMemMap(address, allocation.size, 0, allocation.handle, 0));
     allocation.mapped = true;
     CUmemAccessDesc access = {};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id = allocation.device;
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    DG_CUDA_DRIVER_CHECK(lazy_cuMemSetAccess(address, allocation.size, &access, 1));
+    DJ_CUDA_DRIVER_CHECK(lazy_cuMemSetAccess(address, allocation.size, &access, 1));
 }
 
 inline std::shared_ptr<Allocation> allocate_fabric(int64_t num_bytes, int device, Metadata& metadata) {
     int supported = 0;
-    DG_CUDA_DRIVER_CHECK(lazy_cuDeviceGetAttribute(
+    DJ_CUDA_DRIVER_CHECK(lazy_cuDeviceGetAttribute(
         &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device));
     if (!supported)
         return nullptr;
@@ -137,14 +138,14 @@ inline std::shared_ptr<Allocation> allocate_fabric(int64_t num_bytes, int device
         &granularity, &properties, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
     if (fabric_unavailable(result))
         return nullptr;
-    DG_CUDA_DRIVER_CHECK(result);
+    DJ_CUDA_DRIVER_CHECK(result);
 
     auto allocation = std::make_shared<Allocation>(HandleKind::Fabric, device);
     allocation->size = (static_cast<size_t>(num_bytes) + granularity - 1) / granularity * granularity;
     result = lazy_cuMemCreate(&allocation->handle, allocation->size, &properties, 0);
     if (fabric_unavailable(result))
         return nullptr;
-    DG_CUDA_DRIVER_CHECK(result);
+    DJ_CUDA_DRIVER_CHECK(result);
     allocation->owns_handle = true;
 
     CUmemFabricHandle handle = {};
@@ -152,7 +153,7 @@ inline std::shared_ptr<Allocation> allocate_fabric(int64_t num_bytes, int device
     result = lazy_cuMemExportToShareableHandle(&handle, allocation->handle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
     if (fabric_unavailable(result))
         return nullptr;
-    DG_CUDA_DRIVER_CHECK(result);
+    DJ_CUDA_DRIVER_CHECK(result);
     map_fabric(*allocation);
     std::memcpy(metadata.data() + 2, &handle, sizeof(handle));
     return allocation;
@@ -203,7 +204,7 @@ inline torch::Tensor import_buffer(const Metadata& metadata) {
 #if CUDA_VERSION >= 12030
         CUmemFabricHandle handle;
         std::memcpy(&handle, metadata.data() + 2, sizeof(handle));
-        DG_CUDA_DRIVER_CHECK(lazy_cuMemImportFromShareableHandle(
+        DJ_CUDA_DRIVER_CHECK(lazy_cuMemImportFromShareableHandle(
             &allocation->handle, &handle, CU_MEM_HANDLE_TYPE_FABRIC));
         allocation->owns_handle = true;
         map_fabric(*allocation);
